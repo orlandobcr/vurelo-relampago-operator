@@ -1,0 +1,862 @@
+"""
+Vurelo Relampago Operator · service local.
+
+Uso:
+   python3 server.py                  · default (modo persistido en DB · o manual si vacío)
+   python3 server.py --auto           · forzar AUTO mode al startup
+   python3 server.py --manual         · forzar MANUAL al startup
+   python3 server.py --port 9000      · custom port
+   python3 server.py --no-open        · no auto-open browser
+   python3 server.py --logout         · borra sesión persistida y sale
+   python3 server.py --status         · imprime status y sale
+
+UI: http://localhost:8787
+"""
+import argparse
+import json
+import os
+import signal
+import sys
+import threading
+import time
+import webbrowser
+from flask import Flask, render_template, request, jsonify
+
+from relampago import RelampagoSession
+from kashport import KashportClient
+import storage
+import notifier
+import google_oauth
+import auth as gauth
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+
+# Init SQLite
+storage.init_db()
+
+# ============ Google Auth gate · before_request ============
+
+@app.before_request
+def _auth_gate():
+    return gauth.require_auth()
+
+# Singleton de sesión Relampago + Kashport client
+relampago = RelampagoSession()
+kashport = KashportClient()
+
+# State global · modo auto · processed/skipped
+AUTO_MODE = {"enabled": False}
+PROCESSED_IDS = set()        # items que ya iniciamos a procesar (submit-once persistido in-memory)
+COMPLETED_IDS = set()        # mark-paid OK
+FAILED_IDS = {}              # id → attempts
+EVENT_LOG = []               # últimos eventos · UI debug
+LOG_MAX = 200
+
+
+def log_event(kind: str, payload: dict):
+    EVENT_LOG.append({
+        "kind": kind,
+        "ts": time.strftime("%H:%M:%S"),
+        "payload": payload,
+    })
+    if len(EVENT_LOG) > LOG_MAX:
+        del EVENT_LOG[: len(EVENT_LOG) - LOG_MAX]
+
+
+# ============ Routes · UI ============
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ============ Google OAuth ============
+
+OAUTH_STATE_COOKIE = "vurelo-oauth-state"
+OAUTH_NEXT_COOKIE = "vurelo-oauth-next"
+
+
+def _public_base() -> str:
+    """URL base pública · usa PUBLIC_BASE_URL env o host del request."""
+    env = os.environ.get("PUBLIC_BASE_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    xfh = request.headers.get("X-Forwarded-Host")
+    xfp = request.headers.get("X-Forwarded-Proto", "https")
+    if xfh:
+        return f"{xfp}://{xfh}"
+    return request.host_url.rstrip("/")
+
+
+@app.route("/login")
+def login_page():
+    next_url = request.args.get("next", "/")
+    err = request.args.get("err", "")
+    return render_template("login.html",
+                           next_url=next_url, err=err,
+                           google_configured=google_oauth.is_configured())
+
+
+@app.route("/api/auth/google/start")
+def auth_google_start():
+    if not google_oauth.is_configured():
+        return jsonify({"error": "google_not_configured"}), 503
+    redirect_uri = f"{_public_base()}/api/auth/google/callback"
+    next_url = request.args.get("next", "/")
+    import secrets
+    state = secrets.token_hex(16)
+    auth_url = google_oauth.build_auth_url(redirect_uri, state)
+    from flask import make_response, redirect as flask_redirect
+    resp = make_response(flask_redirect(auth_url))
+    secure = _public_base().startswith("https://")
+    resp.set_cookie(OAUTH_STATE_COOKIE, state, httponly=True, secure=secure,
+                    samesite="Lax", max_age=600, path="/")
+    resp.set_cookie(OAUTH_NEXT_COOKIE, next_url, httponly=True, secure=secure,
+                    samesite="Lax", max_age=600, path="/")
+    return resp
+
+
+@app.route("/api/auth/google/callback")
+def auth_google_callback():
+    from flask import make_response, redirect as flask_redirect
+    code = request.args.get("code")
+    state = request.args.get("state")
+    err = request.args.get("error")
+
+    def err_redirect(msg):
+        resp = make_response(flask_redirect(f"/login?err={msg}"))
+        resp.delete_cookie(OAUTH_STATE_COOKIE)
+        resp.delete_cookie(OAUTH_NEXT_COOKIE)
+        return resp
+
+    if err:
+        return err_redirect(f"Google · {err}")
+    if not code or not state:
+        return err_redirect("callback inválido · falta code o state")
+
+    expected_state = request.cookies.get(OAUTH_STATE_COOKIE)
+    if not expected_state or expected_state != state:
+        return err_redirect("state CSRF inválido · reintenta")
+
+    next_url = request.cookies.get(OAUTH_NEXT_COOKIE) or "/"
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        next_url = "/"
+
+    redirect_uri = f"{_public_base()}/api/auth/google/callback"
+    try:
+        tokens = google_oauth.exchange_code(code, redirect_uri)
+        profile = google_oauth.verify_id_token(tokens["id_token"])
+    except Exception as e:
+        return err_redirect(str(e))
+
+    session_cookie = gauth.sign_session({
+        "email": profile["email"],
+        "name": profile.get("name") or profile["email"].split("@")[0],
+        "picture": profile.get("picture"),
+        "sub": profile.get("sub"),
+    })
+
+    resp = make_response(flask_redirect(next_url))
+    secure = _public_base().startswith("https://")
+    resp.set_cookie(gauth.AUTH_COOKIE_NAME, session_cookie,
+                    httponly=True, secure=secure, samesite="Lax",
+                    max_age=gauth.AUTH_TTL_SECONDS, path="/")
+    resp.delete_cookie(OAUTH_STATE_COOKIE)
+    resp.delete_cookie(OAUTH_NEXT_COOKIE)
+    log_event("google_login", {"email": profile["email"]})
+    return resp
+
+
+@app.route("/api/auth/google/logout", methods=["POST", "GET"])
+def auth_google_logout():
+    from flask import make_response, redirect as flask_redirect
+    resp = make_response(flask_redirect("/login"))
+    resp.delete_cookie(gauth.AUTH_COOKIE_NAME)
+    return resp
+
+
+@app.route("/api/me")
+def api_me():
+    user = gauth.get_current_user()
+    if not user:
+        return jsonify({"authenticated": False}), 401
+    return jsonify({"authenticated": True, "user": user})
+
+
+# ============ Routes · API ============
+
+@app.route("/api/status")
+def api_status():
+    return jsonify({
+        "relampago": relampago.status,
+        "kashport_configured": kashport.configured,
+        "auto_mode": AUTO_MODE["enabled"],
+        "processed_count": len(PROCESSED_IDS),
+        "completed_count": len(COMPLETED_IDS),
+        "failed_count": len(FAILED_IDS),
+        "service": {
+            "auto_loop_running": _auto_thread is not None and _auto_thread.is_alive(),
+            "trueno_sync_running": _trueno_thread is not None and _trueno_thread.is_alive(),
+        },
+    })
+
+
+@app.route("/api/login/password", methods=["POST"])
+def api_login_password():
+    body = request.get_json(force=True, silent=True) or {}
+    email = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not email or not password:
+        return jsonify({"ok": False, "error": "missing_fields"}), 400
+    result = relampago.login_password(email, password)
+    log_event("login_password", {"email": email, "ok": result.get("ok"), "next": result.get("next_step")})
+    return jsonify(result)
+
+
+@app.route("/api/login/mfa", methods=["POST"])
+def api_login_mfa():
+    body = request.get_json(force=True, silent=True) or {}
+    pin = (body.get("pin") or "").strip()
+    if not pin:
+        return jsonify({"ok": False, "error": "missing_pin"}), 400
+    result = relampago.login_mfa(pin)
+    log_event("login_mfa", {"ok": result.get("ok"), "message": result.get("message")})
+    if result.get("ok"):
+        _start_trueno_sync()
+    return jsonify(result)
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    relampago.logout()
+    log_event("logout", {})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    result = relampago.force_refresh()
+    log_event("refresh_manual", result)
+    return jsonify(result)
+
+
+@app.route("/api/balance")
+def api_balance():
+    result = relampago.get_balance()
+    # Check thresholds y disparar alertas si aplica (only-one logic)
+    if result.get("ok"):
+        try:
+            _check_balance_thresholds(result["data"].get("accounts", []))
+        except Exception as e:
+            log_event("threshold_check_error", {"error": str(e)})
+    return jsonify(result)
+
+
+def _check_balance_thresholds(accounts: list):
+    """
+    Para cada account · checa si está bajo el threshold · envía email UNA SOLA VEZ
+    por "evento de saldo bajo" (reset cuando vuelve arriba).
+    """
+    for acc in accounts:
+        acc_type = acc.get("accountType")
+        balance = acc.get("actualBalance", 0)
+        acc_id = acc.get("accountId", "")
+
+        thr = storage.get_threshold(acc_type)
+        if not thr or not thr.get("enabled"):
+            continue
+
+        threshold = thr["threshold_cop"]
+        last_alert = thr.get("last_alert_sent_at")
+
+        if balance < threshold:
+            # Bajo el umbral · ¿alertar?
+            if last_alert is None:
+                # Nunca alertado en este "evento" · enviar AHORA
+                result = notifier.send_low_balance_alert(
+                    account_type=acc_type, account_id=acc_id,
+                    current_balance=balance, threshold=threshold,
+                )
+                if result.get("ok"):
+                    storage.mark_alert_sent(acc_type, balance)
+                    log_event("low_balance_alert_sent", {
+                        "account_type": acc_type,
+                        "balance": balance,
+                        "threshold": threshold,
+                        "recipients_count": result.get("recipients_count"),
+                    })
+                else:
+                    log_event("low_balance_alert_failed", {
+                        "account_type": acc_type, "error": result.get("error"),
+                    })
+            # else · ya se alertó · skip (only-one logic)
+        else:
+            # Saldo arriba del umbral · si había alerta · reset (próxima vez vuelve a enviar)
+            if last_alert is not None:
+                storage.reset_alert_state(acc_type)
+                log_event("balance_recovered", {
+                    "account_type": acc_type, "balance": balance, "threshold": threshold,
+                })
+
+
+@app.route("/api/thresholds")
+def api_thresholds():
+    return jsonify({"items": storage.list_thresholds()})
+
+
+@app.route("/api/thresholds/<account_type>", methods=["POST"])
+def api_set_threshold(account_type):
+    body = request.get_json(force=True, silent=True) or {}
+    threshold = body.get("threshold_cop")
+    enabled = body.get("enabled", True)
+    if threshold is None:
+        return jsonify({"ok": False, "error": "threshold_cop required"}), 400
+    storage.set_threshold(account_type, float(threshold), bool(enabled))
+    log_event("threshold_updated", {"account_type": account_type, "threshold": threshold, "enabled": enabled})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/recipients", methods=["GET", "POST"])
+def api_recipients():
+    if request.method == "GET":
+        return jsonify({"recipients": notifier.get_recipients()})
+    body = request.get_json(force=True, silent=True) or {}
+    emails = body.get("emails") or []
+    notifier.set_recipients(emails)
+    log_event("recipients_updated", {"count": len(emails)})
+    return jsonify({"ok": True, "recipients": notifier.get_recipients()})
+
+
+@app.route("/api/dispersion-rules", methods=["GET", "POST"])
+def api_dispersion_rules():
+    if request.method == "GET":
+        return jsonify({
+            "min_gap_seconds": int(storage.get_setting("dispersion_min_gap_seconds", "15") or "15"),
+            "same_payee_window_minutes": int(storage.get_setting("dispersion_same_payee_window_minutes", "10") or "10"),
+        })
+    body = request.get_json(force=True, silent=True) or {}
+    if "min_gap_seconds" in body:
+        v = max(0, int(body["min_gap_seconds"]))
+        storage.set_setting("dispersion_min_gap_seconds", str(v))
+    if "same_payee_window_minutes" in body:
+        v = max(0, int(body["same_payee_window_minutes"]))
+        storage.set_setting("dispersion_same_payee_window_minutes", str(v))
+    log_event("dispersion_rules_updated", body)
+    return jsonify({
+        "ok": True,
+        "min_gap_seconds": int(storage.get_setting("dispersion_min_gap_seconds", "15")),
+        "same_payee_window_minutes": int(storage.get_setting("dispersion_same_payee_window_minutes", "10")),
+    })
+
+
+@app.route("/api/test-email", methods=["POST"])
+def api_test_email():
+    result = notifier.send_test_email()
+    log_event("test_email", {"ok": result.get("ok"), "error": result.get("error")})
+    return jsonify(result)
+
+
+@app.route("/api/bank-codes")
+def api_bank_codes():
+    return jsonify(relampago.get_bank_codes())
+
+
+@app.route("/api/transactions")
+def api_transactions():
+    return jsonify(relampago.get_transactions())
+
+
+@app.route("/api/kashport/token", methods=["POST"])
+def api_kashport_token():
+    body = request.get_json(force=True, silent=True) or {}
+    token = body.get("token") or ""
+    kashport.set_token(token)
+    # Persistir en SQLite
+    if token:
+        storage.set_setting("kashport_token", token)
+    else:
+        storage.delete_setting("kashport_token")
+    log_event("kashport_token_updated", {"configured": kashport.configured})
+    return jsonify({"ok": True, "configured": kashport.configured, "persisted": True})
+
+
+@app.route("/api/queue")
+def api_queue():
+    return jsonify(kashport.pending())
+
+
+@app.route("/api/process/<item_id>", methods=["POST"])
+def api_process(item_id):
+    """
+    Procesar UN item · validate llave + execute dispersión + mark-paid.
+    Si llave inválida · auto-mark-rejected.
+    """
+    # Hard guard · submit-once
+    if item_id in PROCESSED_IDS or item_id in COMPLETED_IDS:
+        return jsonify({
+            "ok": False,
+            "error": "already_processed",
+            "message": "Item ya fue procesado en esta sesión · skip (anti-doble)",
+        })
+
+    PROCESSED_IDS.add(item_id)
+    log_event("process_start", {"item_id": item_id})
+
+    if not relampago.is_logged_in:
+        PROCESSED_IDS.discard(item_id)
+        return jsonify({"ok": False, "error": "not_logged_in"})
+
+    # Obtener detalle del item desde la queue (necesario para llave + amount)
+    queue_resp = kashport.pending()
+    if not queue_resp.get("ok"):
+        PROCESSED_IDS.discard(item_id)
+        return jsonify({"ok": False, "error": "queue_fetch_failed", "detail": queue_resp})
+
+    items = queue_resp["data"].get("items", [])
+    item = next((it for it in items if it.get("id") == item_id), None)
+    if not item:
+        PROCESSED_IDS.discard(item_id)
+        return jsonify({"ok": False, "error": "item_not_in_queue"})
+
+    key = (item.get("destination") or {}).get("key_value") or (item.get("destination") or {}).get("account_number")
+    # IMPORTANTE · virtualAmount está en CENTAVOS COP · descubierto 2026-05-22
+    # Kashport item trae amount_cop en pesos · multiply x100 para Relampago
+    amount_cop_pesos = item.get("amount_cop") or item.get("amount") or 0
+    virtual_amount_cents = int(round(float(amount_cop_pesos) * 100))
+    routing = item.get("rail") or "breb"
+
+    # Step 0 · check reglas de dispersión (anti-doble + min gap)
+    rules_check = storage.check_dispersion_rules(key, int(amount_cop_pesos))
+    if not rules_check.get("ok"):
+        PROCESSED_IDS.discard(item_id)
+        log_event("rule_blocked", {"item_id": item_id, "reason": rules_check.get("reason"), "detail": rules_check.get("detail")})
+        return jsonify({
+            "ok": False,
+            "rule_blocked": True,
+            "reason": rules_check.get("reason"),
+            "message": rules_check.get("detail"),
+            "wait_seconds": rules_check.get("wait_seconds"),
+            "minutes_ago": rules_check.get("minutes_ago"),
+            "last_tx_id": rules_check.get("last_tx_id"),
+        })
+
+    # Step 1 · resolve-payee (validar llave)
+    resolve = relampago.resolve_payee(key, virtual_amount_cents, routing=routing)
+    if resolve.get("status") == 404:
+        # Llave inválida · auto-reject
+        log_event("payee_invalid", {"item_id": item_id, "key": key})
+        rej = kashport.mark_rejected(item_id, reason="payee_key_invalid", detail="Llave BREB no encontrada · validado vía Relampago API")
+        log_event("auto_rejected", {"item_id": item_id, "kashport_resp": rej})
+        return jsonify({
+            "ok": False,
+            "auto_rejected": True,
+            "key": key,
+            "message": "Llave inválida · auto-rechazada · refund al user",
+            "resolve": resolve,
+            "kashport_reject": rej,
+        })
+    if not resolve.get("ok"):
+        log_event("resolve_error", {"item_id": item_id, "resolve": resolve})
+        FAILED_IDS[item_id] = FAILED_IDS.get(item_id, 0) + 1
+        PROCESSED_IDS.discard(item_id)
+        return jsonify({"ok": False, "error": "resolve_failed", "detail": resolve})
+
+    # Step 2 · execute dispersión · usar el transfer validado del resolve
+    # (incluye payee enriquecido + signature)
+    resolve_data = resolve.get("data", {}).get("data", {})
+    validated_transfers = resolve_data.get("transfers", [])
+    if not validated_transfers:
+        return jsonify({"ok": False, "error": "no_validated_transfer"})
+
+    # Personalizar el description/reference con el oldvprovider_id
+    validated = validated_transfers[0]
+    validated["description"] = item.get("oldvprovider_id", "Vurelo dispersion")
+    validated["reference"] = item.get("oldvprovider_id", "")
+
+    execute = relampago.execute_dispersion([validated])
+    log_event("execute_attempt", {"item_id": item_id, "resp_status": execute.get("status")})
+
+    if not execute.get("ok"):
+        # NO mark-paid · pero submit ya pasó · NO retry
+        log_event("execute_failed", {"item_id": item_id, "detail": execute})
+        return jsonify({
+            "ok": False,
+            "error": "execute_failed",
+            "message": "Submit a Relampago falló · revisar Trueno manualmente",
+            "detail": execute,
+        })
+
+    # Extract transaction info del response
+    txn = execute.get("data", {}).get("data", {}).get("transaction", {})
+    relampago_tx_id = txn.get("id")
+    external_id = txn.get("externalId")
+    state = txn.get("state", "unknown")
+
+    # Persistir en SQLite para audit + cross-reference futura
+    payee = txn.get("payee", {})
+    ba = payee.get("bankAccount", {})
+    try:
+        storage.record_sent_dispersion(
+            kashport_id=item_id,
+            kashport_provider_id=item.get("oldvprovider_id"),
+            relampago_tx_id=relampago_tx_id,
+            external_id=external_id,
+            payee_name=payee.get("name"),
+            payee_key=ba.get("key") or ba.get("number"),
+            payee_doc=payee.get("documentNumber"),
+            payee_bank=ba.get("bankName"),
+            amount_cop=int(amount_cop_pesos),
+            rail=routing,
+            initial_state=state,
+            request_body={"transfers": [validated]},
+            response_body=execute.get("data"),
+        )
+    except Exception as e:
+        log_event("storage_error", {"error": str(e)})
+
+    # Step 3 · mark-paid en Kashport · con IDs trazables
+    paid = kashport.mark_paid(item_id, meta={
+        "auto_via": "relampago_api_v1",
+        "relampago_tx_id": relampago_tx_id,
+        "external_id": external_id,
+        "state": state,
+        "provider": txn.get("provider"),
+    })
+    if paid.get("ok"):
+        COMPLETED_IDS.add(item_id)
+        log_event("completed", {
+            "item_id": item_id,
+            "relampago_tx_id": relampago_tx_id,
+            "external_id": external_id,
+            "state": state,
+        })
+        return jsonify({
+            "ok": True,
+            "message": f"Dispersión OK · ${amount_cop_pesos:,.0f} → {key}",
+            "relampago_tx_id": relampago_tx_id,
+            "external_id": external_id,
+            "state": state,
+            "provider": txn.get("provider"),
+        })
+    log_event("paid_failed", {"item_id": item_id, "paid": paid})
+    return jsonify({
+        "ok": False,
+        "error": "mark_paid_failed",
+        "message": "Dispersión OK pero mark-paid en Kashport falló · revisar",
+        "relampago_tx_id": relampago_tx_id,
+        "external_id": external_id,
+        "paid": paid,
+    })
+
+
+@app.route("/api/reject/<item_id>", methods=["POST"])
+def api_reject(item_id):
+    body = request.get_json(force=True, silent=True) or {}
+    reason = body.get("reason", "manual_reject")
+    detail = body.get("detail", "Rechazado manualmente desde Vurelo Operator")
+    result = kashport.mark_rejected(item_id, reason=reason, detail=detail)
+    if result.get("ok"):
+        COMPLETED_IDS.add(item_id)
+    log_event("manual_reject", {"item_id": item_id, "result": result})
+    return jsonify(result)
+
+
+@app.route("/api/sent")
+def api_sent():
+    """Lista de dispersiones enviadas vía esta app (persistidas en SQLite)."""
+    return jsonify({"items": storage.list_sent_dispersions(limit=100)})
+
+
+@app.route("/api/trueno")
+def api_trueno():
+    """Última snapshot de transacciones Trueno (sync background cada 60s)."""
+    state_filter = request.args.get("state")
+    return jsonify({"items": storage.list_trueno_transactions(state=state_filter, limit=200)})
+
+
+@app.route("/api/attention")
+def api_attention():
+    """Items que requieren atención · ej. rejected_after_sent."""
+    only_open = request.args.get("open", "1") == "1"
+    return jsonify({"items": storage.list_attention(only_open=only_open, limit=100)})
+
+
+@app.route("/api/attention/<int:attn_id>/ack", methods=["POST"])
+def api_attention_ack(attn_id):
+    storage.acknowledge_attention(attn_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/stats")
+def api_stats():
+    return jsonify(storage.stats())
+
+
+@app.route("/api/sync-trueno", methods=["POST"])
+def api_sync_trueno():
+    """Force pull de /account/transactions?accountType=Trueno · update DB."""
+    result = _do_trueno_sync()
+    return jsonify(result)
+
+
+@app.route("/api/auto", methods=["POST"])
+def api_auto_toggle():
+    body = request.get_json(force=True, silent=True) or {}
+    enabled = bool(body.get("enabled"))
+    AUTO_MODE["enabled"] = enabled
+    # Persistir en app_settings para sobrevivir restart del service
+    storage.set_setting("auto_mode", "1" if enabled else "0")
+    log_event("auto_mode_changed", {"enabled": enabled, "persisted": True})
+    if enabled:
+        _start_auto_loop()
+    else:
+        _auto_stop.set()
+    return jsonify({"ok": True, "enabled": enabled, "persisted": True})
+
+
+@app.route("/api/events")
+def api_events():
+    return jsonify({"events": EVENT_LOG[-100:]})
+
+
+# ============ Auto mode background loop ============
+
+_auto_thread = None
+_auto_stop = threading.Event()
+
+
+def _start_auto_loop():
+    global _auto_thread
+    if _auto_thread and _auto_thread.is_alive():
+        return
+    _auto_stop.clear()
+    _auto_thread = threading.Thread(target=_auto_loop, daemon=True, name="auto-process")
+    _auto_thread.start()
+
+
+def _auto_loop():
+    """Loop que procesa items pending automáticamente. Configurable."""
+    POLL_INTERVAL = 15  # segundos
+    while not _auto_stop.is_set():
+        if not AUTO_MODE["enabled"]:
+            break
+        if not relampago.is_logged_in or not kashport.configured:
+            time.sleep(5)
+            continue
+
+        try:
+            q = kashport.pending()
+            if q.get("ok"):
+                items = q["data"].get("items", [])
+                for it in items:
+                    if not AUTO_MODE["enabled"]:
+                        break
+                    iid = it.get("id")
+                    if not iid or iid in PROCESSED_IDS or iid in COMPLETED_IDS:
+                        continue
+                    if FAILED_IDS.get(iid, 0) >= 1:
+                        continue  # MAX_RETRIES = 1 (igual que la extension)
+                    log_event("auto_processing", {"item_id": iid})
+                    # Re-uso la lógica del endpoint
+                    with app.test_request_context():
+                        # Llamar api_process directo
+                        api_process(iid)
+        except Exception as e:
+            log_event("auto_error", {"error": str(e)})
+
+        if _auto_stop.wait(POLL_INTERVAL):
+            break
+
+
+# ============ Trueno sync · poll periódico ============
+
+_trueno_thread = None
+_trueno_stop = threading.Event()
+
+
+def _do_trueno_sync():
+    """Trae /account/transactions?accountType=Trueno y persiste en DB. Detecta rejected."""
+    if not relampago.is_logged_in:
+        return {"ok": False, "error": "not_logged_in"}
+    try:
+        r = relampago.session.get(
+            "https://api.relampago-pay.io/v0/account/transactions",
+            params={"accountType": "Trueno"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "status": r.status_code, "body": r.text[:300]}
+        transfers = r.json().get("data", {}).get("transfers", [])
+        for t in transfers:
+            storage.upsert_trueno_transaction(t)
+        # Cross-reference (detecta rejected_after_sent)
+        new_attns = storage.cross_reference_sent_vs_trueno()
+        log_event("trueno_sync", {"count": len(transfers), "new_attention": new_attns})
+        return {"ok": True, "count": len(transfers), "new_attention": new_attns}
+    except Exception as e:
+        log_event("trueno_sync_error", {"error": str(e)})
+        return {"ok": False, "error": str(e)}
+
+
+def _trueno_sync_loop():
+    POLL_INTERVAL = 60  # cada 60s
+    while not _trueno_stop.is_set():
+        if relampago.is_logged_in:
+            _do_trueno_sync()
+        if _trueno_stop.wait(POLL_INTERVAL):
+            break
+
+
+def _start_trueno_sync():
+    global _trueno_thread
+    if _trueno_thread and _trueno_thread.is_alive():
+        return
+    _trueno_stop.clear()
+    _trueno_thread = threading.Thread(target=_trueno_sync_loop, daemon=True, name="trueno-sync")
+    _trueno_thread.start()
+
+
+# Arrancar sync loop después del primer login OK
+# (lo hacemos en el endpoint login_mfa hook)
+_original_login_mfa = api_login_mfa
+
+
+# ============ Startup / Shutdown ============
+
+def _startup(args):
+    """Restaurar estado · cookies + auto_mode · health check."""
+    # 1. Cargar Kashport token persistido
+    saved_kashport = storage.get_setting("kashport_token", "")
+    if saved_kashport:
+        kashport.set_token(saved_kashport)
+        print("✓ Kashport token cargado de SQLite")
+
+    # 2. Restaurar sesión Relampago
+    restored = relampago.restore_from_storage()
+    session_alive = False
+    if restored:
+        print(f"⏳ Cookies restauradas (email={relampago._last_login_email}) · verificando...")
+        session_alive = relampago.verify_session_alive()
+        if session_alive:
+            print(f"✓ Sesión Relampago VIVA · refresh count={relampago._refresh_count}")
+            _start_trueno_sync()
+        else:
+            print("✗ Sesión Relampago muerta · UI pedirá re-login")
+    else:
+        print("· Sin sesión previa · UI pedirá login")
+
+    # 3. Resolver auto_mode (CLI flag > DB > default manual)
+    if args.auto:
+        AUTO_MODE["enabled"] = True
+        storage.set_setting("auto_mode", "1")
+        print("▶ AUTO mode FORZADO por CLI flag --auto")
+    elif args.manual:
+        AUTO_MODE["enabled"] = False
+        storage.set_setting("auto_mode", "0")
+        print("· MANUAL mode FORZADO por CLI flag --manual")
+    else:
+        saved = storage.get_setting("auto_mode", "0")
+        AUTO_MODE["enabled"] = saved == "1"
+        print(f"· Modo restaurado de SQLite · {'AUTO' if AUTO_MODE['enabled'] else 'MANUAL'}")
+
+    # 4. Si auto + session alive · arrancar auto loop
+    if AUTO_MODE["enabled"] and session_alive:
+        _start_auto_loop()
+        print("▶ AUTO loop arrancado")
+    elif AUTO_MODE["enabled"] and not session_alive:
+        print("⚠ AUTO mode ON pero session muerta · loop arrancará tras login")
+
+    return session_alive
+
+
+def _shutdown_handler(signum, frame):
+    print("\n· SIGTERM recibido · graceful shutdown...")
+    try:
+        if relampago.is_logged_in:
+            relampago.persist_to_storage()
+            print("✓ Sesión final persistida a SQLite")
+    except Exception as e:
+        print(f"✗ Error al persistir · {e}")
+    _auto_stop.set()
+    _trueno_stop.set()
+    sys.exit(0)
+
+
+def _cli_status():
+    """Imprime status del service (sin arrancar Flask)."""
+    sess = storage.load_session()
+    auto = storage.get_setting("auto_mode", "0") == "1"
+    ks_set = bool(storage.get_setting("kashport_token", ""))
+    print("=" * 50)
+    print(f"DB:               {storage.DB_PATH}")
+    if sess:
+        ttl = (sess.get("token_expires_at") or 0) - time.time()
+        print(f"Sesión guardada:  ✓ email={sess['email']} · expira en {int(ttl)}s")
+        print(f"  refresh_count:  {sess.get('refresh_count', 0)}")
+        print(f"  cookies:        {list(sess['cookies'].keys())}")
+    else:
+        print("Sesión guardada:  ✗ (necesita login)")
+    print(f"Kashport token:   {'✓ configurado' if ks_set else '✗ no configurado'}")
+    print(f"Auto mode:        {'AUTO' if auto else 'MANUAL'}")
+    print(f"Stats:            {storage.stats()}")
+    print("=" * 50)
+
+
+def _cli_logout():
+    """Borra sesión persistida (sin arrancar Flask)."""
+    storage.clear_session()
+    print("✓ Sesión persistida borrada · próximo arranque pedirá login")
+
+
+# ============ Run ============
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="Vurelo Relampago Operator service")
+    ap.add_argument("--auto", action="store_true", help="Forzar AUTO mode al startup")
+    ap.add_argument("--manual", action="store_true", help="Forzar MANUAL mode al startup")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "3000")))
+    ap.add_argument("--host", default=os.environ.get("BIND_HOST", "127.0.0.1"),
+                    help="Bind host · default 127.0.0.1 local · 0.0.0.0 en Docker")
+    ap.add_argument("--no-open", action="store_true", help="No auto-open browser")
+    ap.add_argument("--logout", action="store_true", help="Borra sesión persistida y sale")
+    ap.add_argument("--status", action="store_true", help="Imprime status y sale")
+    args = ap.parse_args()
+    if args.auto and args.manual:
+        print("✗ --auto y --manual son mutuamente excluyentes")
+        sys.exit(1)
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    # Init DB siempre (lo necesitan --status y --logout también)
+    storage.init_db()
+
+    if args.status:
+        _cli_status()
+        sys.exit(0)
+    if args.logout:
+        _cli_logout()
+        sys.exit(0)
+
+    # Startup
+    print(f"\n╔══════════════════════════════════════════════════╗")
+    print(f"║  Vurelo Relampago Operator · service")
+    print(f"║  Port      · {args.port}")
+    print(f"║  Auto flag · {args.auto or args.manual}")
+    print(f"║  UI        · http://localhost:{args.port}")
+    print(f"║  DB        · {storage.DB_PATH}")
+    print(f"╚══════════════════════════════════════════════════╝\n")
+
+    session_alive = _startup(args)
+
+    # Signal handlers para graceful shutdown
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
+    # Auto-open browser si no se desactiva
+    if not args.no_open:
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{args.port}")).start()
+
+    app.run(host=args.host, port=args.port, debug=False, threaded=True, use_reloader=False)

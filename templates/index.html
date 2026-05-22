@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Vurelo Relampago Operator</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header>
+  <h1>⚡ Vurelo Relampago Operator</h1>
+  <div class="status-row">
+    <span id="status-dot" class="dot off"></span>
+    <span id="status-text">desconectado</span>
+    <span id="email-text" class="muted"></span>
+    <span class="header-sep">·</span>
+    <span class="muted small" id="google-user">cargando...</span>
+    <button id="logout-btn" class="btn-tiny" style="display:none">logout Relampago</button>
+    <a href="/api/auth/google/logout" class="btn-tiny" id="logout-google">logout Google</a>
+  </div>
+</header>
+
+<!-- Banner · service pausado (Google OK · Relampago session muerta) -->
+<div id="service-paused-banner" class="banner hidden">
+  ⚠ Servicio pausado · sesión Relampago expirada · ningún proceso automático corriendo.
+  <strong>Re-loguéate abajo</strong> para reactivar el refresh + auto loop.
+</div>
+
+<!-- ============ LOGIN VIEW (Relampago) ============ -->
+<section id="view-login" class="view view-centered">
+  <div id="login-context" class="muted small" style="text-align:center; margin-bottom:8px;"></div>
+  <h2>Iniciar sesión Relampago</h2>
+  <p class="muted" id="login-subtext">
+    Una sola vez · el service mantiene la sesión viva 24/7 con refresh automático.<br>
+    Las credenciales NO se guardan en disco.
+  </p>
+  <div class="card">
+    <label>Email Relampago
+      <input id="login-email" type="email" placeholder="otc@vureloapp.com" value="otc@vureloapp.com">
+    </label>
+    <label>Password
+      <input id="login-password" type="password" placeholder="••••••••">
+    </label>
+    <button id="login-btn" class="btn-primary">Continuar →</button>
+    <div id="login-msg" class="msg"></div>
+  </div>
+</section>
+
+<!-- ============ MFA VIEW ============ -->
+<section id="view-mfa" class="view view-centered hidden">
+  <h2>Ingresa PIN del TOTP</h2>
+  <p class="muted">Abre la app autenticadora · 6 dígitos.</p>
+  <div class="card">
+    <label>PIN <input id="mfa-pin" type="text" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code"></label>
+    <button id="mfa-btn" class="btn-primary">Confirmar</button>
+    <div id="mfa-msg" class="msg"></div>
+  </div>
+</section>
+
+<!-- ============ APP (con sidebar) ============ -->
+<div id="view-app" class="app-shell hidden">
+
+  <aside class="sidebar">
+    <nav>
+      <a href="#" class="nav-link active" data-view="home">
+        <span class="nav-icon">🏠</span><span>Home</span>
+        <span class="nav-badge" id="nav-kashport-count">0</span>
+      </a>
+      <a href="#" class="nav-link" data-view="trueno">
+        <span class="nav-icon">⚡</span><span>Trueno</span>
+        <span class="nav-badge" id="nav-trueno-count">0</span>
+      </a>
+      <a href="#" class="nav-link" data-view="attention">
+        <span class="nav-icon">🚨</span><span>Atención</span>
+        <span class="nav-badge red" id="nav-attn-count">0</span>
+      </a>
+      <a href="#" class="nav-link" data-view="logs">
+        <span class="nav-icon">📜</span><span>Logs</span>
+      </a>
+      <a href="#" class="nav-link" data-view="settings">
+        <span class="nav-icon">⚙️</span><span>Configuración</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="muted small" id="sidebar-status">cargando...</div>
+    </div>
+  </aside>
+
+  <main class="content">
+
+    <!-- HOME · Kashport + Sent (las listas chicas) ============== -->
+    <section class="subview" data-view="home">
+
+      <!-- Top resumen (stats + balance + modo en una sola fila compacta) -->
+      <div class="grid-3">
+        <div class="card mini">
+          <h3>Saldos</h3>
+          <div id="balance-list">cargando...</div>
+          <button id="refresh-balance" class="btn-tiny" style="margin-top:6px">↻</button>
+        </div>
+
+        <div class="card mini">
+          <h3>Stats</h3>
+          <div class="stats-mini">
+            <div><span class="muted small">Enviadas</span><strong id="stat-sent">0</strong></div>
+            <div><span class="muted small">Trueno</span><strong id="stat-trueno">0</strong></div>
+            <div><span class="muted small">Rejected</span><strong id="stat-rejected" class="red">0</strong></div>
+            <div><span class="muted small">⚠</span><strong id="stat-attn" class="red">0</strong></div>
+          </div>
+        </div>
+
+        <div class="card mini">
+          <h3>Modo</h3>
+          <div class="row">
+            <label class="switch">
+              <input id="auto-toggle" type="checkbox">
+              <span class="slider"></span>
+            </label>
+            <span id="auto-label">MANUAL</span>
+          </div>
+          <p class="muted small" id="auto-help">click "▶ Procesar" item por item</p>
+        </div>
+      </div>
+
+      <!-- Cola Kashport · pendientes a procesar -->
+      <div class="card">
+        <h3>
+          📥 Cola Kashport · pendientes
+          <span id="queue-count" class="badge">0</span>
+          <button id="refresh-queue" class="btn-tiny right">↻</button>
+        </h3>
+        <div id="queue-list">cargando...</div>
+      </div>
+
+      <!-- Dispersiones enviadas -->
+      <div class="card">
+        <h3>
+          📤 Dispersiones enviadas por esta app
+          <span id="sent-count" class="badge">0</span>
+          <button id="refresh-sent" class="btn-tiny right">↻</button>
+        </h3>
+        <p class="muted small">Histórico SQLite · state se actualiza con cada sync Trueno.</p>
+        <div id="sent-list">cargando...</div>
+      </div>
+
+    </section>
+
+    <!-- TRUENO · big list ====================================== -->
+    <section class="subview hidden" data-view="trueno">
+      <h2>
+        ⚡ Transacciones Trueno
+        <span id="trueno-count" class="badge">0</span>
+        <button id="refresh-trueno" class="btn-tiny right">↻ Sync ahora</button>
+        <select id="trueno-filter" class="filter-select">
+          <option value="">Todos</option>
+          <option value="approved">approved</option>
+          <option value="rejected">rejected</option>
+          <option value="created">created</option>
+        </select>
+      </h2>
+      <p class="muted small">Snapshot real de /v0/account/transactions?accountType=Trueno · auto-sync 60s.</p>
+      <div id="trueno-list" class="big-list">cargando...</div>
+    </section>
+
+    <!-- ATTENTION ============================================== -->
+    <section class="subview hidden" data-view="attention">
+      <h2>
+        🚨 Items que requieren atención
+        <span id="attn-count" class="badge red">0</span>
+      </h2>
+      <p class="muted small">Cross-reference automático · enviadas OK pero Trueno reportó rejected.</p>
+      <div id="attention-list" class="big-list">cargando...</div>
+    </section>
+
+    <!-- LOGS =================================================== -->
+    <section class="subview hidden" data-view="logs">
+      <h2>📜 Event log</h2>
+      <div id="event-log"></div>
+    </section>
+
+    <!-- SETTINGS =============================================== -->
+    <section class="subview hidden" data-view="settings">
+      <h2>⚙️ Configuración</h2>
+
+      <div class="card">
+        <h3>Token operador Kashport</h3>
+        <p class="muted small">Necesario para listar la cola y mark-paid/rejected.</p>
+        <label>
+          <input id="kashport-token" type="password" placeholder="Bearer token Kashport">
+        </label>
+        <button id="kashport-save" class="btn-primary">Guardar</button>
+        <div id="kashport-msg" class="msg"></div>
+      </div>
+
+      <div class="card">
+        <h3>Sesión</h3>
+        <div id="session-info" class="muted">cargando...</div>
+        <div class="row" style="gap:6px; margin-top:10px;">
+          <button id="manual-refresh-session" class="btn-tiny">⟳ Refresh token</button>
+          <button id="sync-trueno-btn" class="btn-tiny">⚡ Sync Trueno</button>
+          <button id="logout-from-settings" class="btn-danger">Cerrar sesión</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>📐 Reglas de dispersión</h3>
+        <p class="muted small">
+          BREB bloquea dispersiones consecutivas al MISMO beneficiario con el MISMO monto exacto en ventanas cortas.
+          Las dispersiones generales también deben tener un gap mínimo para evitar rate-limit.
+        </p>
+        <div class="row" style="gap:14px; flex-wrap:wrap;">
+          <label style="flex:1; min-width:220px;">
+            Gap mínimo global (segundos)
+            <input id="rule-gap-seconds" type="number" min="0" step="1" value="15">
+          </label>
+          <label style="flex:1; min-width:220px;">
+            Anti-duplicado mismo payee+monto (minutos)
+            <input id="rule-window-min" type="number" min="0" step="1" value="10">
+          </label>
+        </div>
+        <p class="muted small" id="rule-current">cargando...</p>
+        <button id="save-rules" class="btn-primary">Guardar reglas</button>
+        <div id="rules-msg" class="msg"></div>
+      </div>
+
+      <div class="card">
+        <h3>⚠ Alertas de saldo bajo</h3>
+        <p class="muted small">Cuando un saldo cae bajo el umbral · se envía UN email (no spam) a los destinatarios.</p>
+
+        <table class="threshold-table">
+          <thead>
+            <tr><th>Cuenta</th><th>Umbral (COP)</th><th>Estado</th><th></th></tr>
+          </thead>
+          <tbody id="threshold-rows">
+            <tr><td colspan="4" class="muted">cargando...</td></tr>
+          </tbody>
+        </table>
+
+        <h4 style="margin-top:18px">Destinatarios</h4>
+        <p class="muted small">Uno por línea · solo emails @vureloapp.com o @digitall.io idealmente.</p>
+        <textarea id="recipients-input" rows="4" style="width:100%; background:#0e1419; color:#e4e7eb; border:1px solid #2e3a48; border-radius:6px; padding:8px; font-family:monospace; font-size:12px;"></textarea>
+        <div class="row" style="gap:6px; margin-top:8px;">
+          <button id="save-recipients" class="btn-primary">Guardar destinatarios</button>
+          <button id="test-email" class="btn-tiny">Enviar email de prueba</button>
+        </div>
+        <div id="alerts-msg" class="msg"></div>
+      </div>
+
+      <div class="card">
+        <h3>Storage</h3>
+        <div id="storage-info" class="muted">cargando...</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

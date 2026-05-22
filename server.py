@@ -382,6 +382,19 @@ def api_kashport_token():
 
 @app.route("/api/queue")
 def api_queue():
+    """
+    AUTO ON  · usa el cache del poller background (fresco · cada 30s).
+    AUTO OFF · fetch sincrónico (solo cuando UI lo pide · no consume sin necesidad).
+    """
+    if AUTO_MODE["enabled"] and KASHPORT_CACHE["data"] is not None:
+        return jsonify({
+            "ok": KASHPORT_CACHE["ok"],
+            "data": KASHPORT_CACHE["data"] or {"items": [], "count": 0},
+            "fetched_at": KASHPORT_CACHE["fetched_at"],
+            "from_cache": True,
+            "error": KASHPORT_CACHE.get("error"),
+        })
+    # AUTO OFF · fetch directo
     return jsonify(kashport.pending())
 
 
@@ -609,8 +622,10 @@ def api_auto_toggle():
     log_event("auto_mode_changed", {"enabled": enabled, "persisted": True})
     if enabled:
         _start_auto_loop()
+        _start_kashport_poller()
     else:
         _auto_stop.set()
+        _kashport_stop.set()
     return jsonify({"ok": True, "enabled": enabled, "persisted": True})
 
 
@@ -623,6 +638,79 @@ def api_events():
 
 _auto_thread = None
 _auto_stop = threading.Event()
+
+# ============ Kashport queue poller (siempre activo) ============
+
+KASHPORT_CACHE = {
+    "ok": False,
+    "data": None,           # {items, count, today}
+    "fetched_at": None,     # ISO timestamp
+    "fetched_epoch": None,
+    "consecutive_errors": 0,
+    "error": None,
+    "last_item_count": 0,   # para detectar cambios
+}
+
+_kashport_thread = None
+_kashport_stop = threading.Event()
+KASHPORT_POLL_INTERVAL = 30  # seconds · configurable
+
+
+def _start_kashport_poller():
+    global _kashport_thread
+    if _kashport_thread and _kashport_thread.is_alive():
+        return
+    _kashport_stop.clear()
+    _kashport_thread = threading.Thread(target=_kashport_poller_loop, daemon=True, name="kashport-poller")
+    _kashport_thread.start()
+    log_event("kashport_poller_started", {"interval_s": KASHPORT_POLL_INTERVAL})
+
+
+def _kashport_poller_loop():
+    """
+    Poller Kashport · ACTIVO SOLO cuando AUTO mode ON.
+    Cache resultado · UI lee de aquí cuando activo.
+    Procesamiento separado en _auto_loop (que lee del cache).
+    Si AUTO se apaga · poller termina (kashport NO consulta más a nivel servicio).
+    """
+    while not _kashport_stop.is_set():
+        if not AUTO_MODE["enabled"]:
+            # AUTO apagado · terminar poller
+            log_event("kashport_poller_stopped", {"reason": "auto_off"})
+            break
+        if kashport.configured:
+            try:
+                r = kashport.pending()
+                if r.get("ok"):
+                    new_count = r["data"].get("count", 0)
+                    prev_count = KASHPORT_CACHE.get("last_item_count", 0)
+                    KASHPORT_CACHE.update({
+                        "ok": True,
+                        "data": r["data"],
+                        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                        "fetched_epoch": time.time(),
+                        "consecutive_errors": 0,
+                        "error": None,
+                        "last_item_count": new_count,
+                    })
+                    # Log si hay cambios en cantidad (nuevos items o procesados)
+                    if new_count != prev_count:
+                        log_event("kashport_queue_changed", {
+                            "prev": prev_count, "now": new_count, "delta": new_count - prev_count,
+                        })
+                else:
+                    KASHPORT_CACHE["consecutive_errors"] += 1
+                    KASHPORT_CACHE["error"] = r.get("error") or r.get("body")
+                    if KASHPORT_CACHE["consecutive_errors"] in (3, 10, 30):
+                        log_event("kashport_poll_errors", {
+                            "count": KASHPORT_CACHE["consecutive_errors"],
+                            "error": KASHPORT_CACHE["error"],
+                        })
+            except Exception as e:
+                KASHPORT_CACHE["consecutive_errors"] += 1
+                KASHPORT_CACHE["error"] = str(e)
+        if _kashport_stop.wait(KASHPORT_POLL_INTERVAL):
+            break
 
 
 def _start_auto_loop():
@@ -759,12 +847,13 @@ def _startup(args):
         AUTO_MODE["enabled"] = saved == "1"
         print(f"· Modo restaurado de SQLite · {'AUTO' if AUTO_MODE['enabled'] else 'MANUAL'}")
 
-    # 4. Si auto + session alive · arrancar auto loop
+    # 4. Si auto + session alive · arrancar auto loop + kashport poller
     if AUTO_MODE["enabled"] and session_alive:
         _start_auto_loop()
-        print("▶ AUTO loop arrancado")
+        _start_kashport_poller()
+        print("▶ AUTO loop + Kashport poller arrancados")
     elif AUTO_MODE["enabled"] and not session_alive:
-        print("⚠ AUTO mode ON pero session muerta · loop arrancará tras login")
+        print("⚠ AUTO mode ON pero session muerta · loops arrancarán tras login")
 
     return session_alive
 

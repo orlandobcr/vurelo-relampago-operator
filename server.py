@@ -621,38 +621,40 @@ def api_process(item_id):
     except Exception as e:
         log_event("storage_error", {"error": str(e)})
 
-    # Step 3 · mark-paid en Kashport · con IDs trazables
-    paid = kashport.mark_paid(item_id, meta={
-        "auto_via": "relampago_api_v1",
+    # ============ Step 3 · NEW FLOW 2026-05-23 · two-phase Kashport finalize ============
+    # Pre-fix · mark-paid Kashport INMEDIATAMENTE post-execute_dispersion.
+    #          Pero Relampago retorna state='created' inmediato · NO state FINAL.
+    #          Kashport recibía "paid" sin garantía Relampago realmente sent.
+    #
+    # Post-fix · NO mark-paid acá · solo persistir en sent_dispersions (state="created",
+    #            kashport_finalized=0, awaiting_since=now).
+    #            _do_trueno_sync (cron) poll Relampago state · cuando detect state FINAL
+    #            (approved/sent OR rejected/declined) → entonces mark Kashport.
+    #
+    # Garantías:
+    #   · Kashport SOLO recibe paid si Relampago confirma sent realmente
+    #   · Kashport SOLO recibe rejected si Relampago confirma declination
+    #   · Si Relampago state nunca finaliza · timeout cron escalate operator
+    log_event("execute_pending_relampago_final", {
+        "item_id": item_id,
+        "relampago_tx_id": relampago_tx_id,
+        "external_id": external_id,
+        "initial_state": state,
+        "amount_cop": int(amount_cop_pesos),
+    })
+
+    COMPLETED_IDS.add(item_id)  # local in-memory · evitar re-process item esta sesión
+    return jsonify({
+        "ok": True,
+        "phase": "awaiting_relampago_final",
+        "message": (
+            f"Dispersión enviada · ${amount_cop_pesos:,.0f} → {key} · "
+            f"esperando estado final Relampago (vtrx={relampago_tx_id})"
+        ),
         "relampago_tx_id": relampago_tx_id,
         "external_id": external_id,
         "state": state,
         "provider": txn.get("provider"),
-    })
-    if paid.get("ok"):
-        COMPLETED_IDS.add(item_id)
-        log_event("completed", {
-            "item_id": item_id,
-            "relampago_tx_id": relampago_tx_id,
-            "external_id": external_id,
-            "state": state,
-        })
-        return jsonify({
-            "ok": True,
-            "message": f"Dispersión OK · ${amount_cop_pesos:,.0f} → {key}",
-            "relampago_tx_id": relampago_tx_id,
-            "external_id": external_id,
-            "state": state,
-            "provider": txn.get("provider"),
-        })
-    log_event("paid_failed", {"item_id": item_id, "paid": paid})
-    return jsonify({
-        "ok": False,
-        "error": "mark_paid_failed",
-        "message": "Dispersión OK pero mark-paid en Kashport falló · revisar",
-        "relampago_tx_id": relampago_tx_id,
-        "external_id": external_id,
-        "paid": paid,
     })
 
 
@@ -862,7 +864,8 @@ _trueno_stop = threading.Event()
 
 def _do_trueno_sync():
     """Trae /account/transactions?accountType=Trueno y persiste en DB. Detecta rejected.
-    2026-05-23 · refactor · usa relampago.get_trueno_transactions() · NO acceso direct a session."""
+    2026-05-23 · refactor · usa relampago.get_trueno_transactions() · NO acceso direct a session.
+    2026-05-23 · NEW · finalize Kashport SOLO cuando Relampago state final detectado."""
     result = relampago.get_trueno_transactions()
     if not result.get("ok"):
         if result.get("error") == "not_logged_in":
@@ -875,11 +878,153 @@ def _do_trueno_sync():
             storage.upsert_trueno_transaction(t)
         # Cross-reference (detecta rejected_after_sent)
         new_attns = storage.cross_reference_sent_vs_trueno()
-        log_event("trueno_sync", {"count": len(transfers), "new_attention": new_attns})
-        return {"ok": True, "count": len(transfers), "new_attention": new_attns}
+        # NEW · finalize Kashport para sent_dispersions awaiting + state final detectado
+        finalized = _finalize_pending_kashport_marks()
+        log_event("trueno_sync", {
+            "count": len(transfers),
+            "new_attention": new_attns,
+            "kashport_finalized": finalized,
+        })
+        return {"ok": True, "count": len(transfers), "new_attention": new_attns, "kashport_finalized": finalized}
     except Exception as e:
         log_event("trueno_sync_error", {"error": str(e)})
         return {"ok": False, "error": str(e)}
+
+
+# ============ Two-phase Kashport finalize · 2026-05-23 · NEW ============
+
+# Relampago states · clasificación final
+# Approved/sent · transferencia completada con éxito
+# Rejected/declined · transferencia rechazada por Relampago/destino
+# Created/pending · aún en flight · NO finalize todavía
+RELAMPAGO_STATES_FINAL_OK = {"approved", "sent", "executed", "completed", "settled"}
+RELAMPAGO_STATES_FINAL_FAIL = {"rejected", "declined", "failed", "cancelled", "canceled"}
+
+
+def _finalize_pending_kashport_marks() -> dict:
+    """
+    Procesa sent_dispersions con kashport_finalized=0 ·
+    si Relampago state es final · mark Kashport correspondiente.
+
+    Returns · {marked_paid: N, marked_rejected: N, still_awaiting: N, errors: [...]}
+    """
+    awaiting = storage.list_awaiting_kashport_finalize()
+    out = {"marked_paid": 0, "marked_rejected": 0, "still_awaiting": 0, "errors": []}
+
+    for record in awaiting:
+        vtrx_id = record.get("relampago_tx_id")
+        kashport_id = record.get("kashport_id")
+        if not vtrx_id or not kashport_id:
+            continue
+
+        # Lookup state en trueno_transactions (sync source)
+        try:
+            trueno_rows = storage.list_trueno_transactions(state=None, limit=10000)
+            trueno_match = next(
+                (t for t in trueno_rows if t.get("transaction_id") == vtrx_id),
+                None,
+            )
+        except Exception as e:
+            out["errors"].append({"vtrx": vtrx_id, "error": f"lookup_failed: {e}"})
+            continue
+
+        if not trueno_match:
+            # vtrx aún NO aparece en trueno_sync · still pending
+            out["still_awaiting"] += 1
+            continue
+
+        state = (trueno_match.get("state") or "").lower()
+        declination = trueno_match.get("declination_reason")
+
+        if state in RELAMPAGO_STATES_FINAL_OK:
+            # FINAL OK · mark Kashport paid
+            try:
+                paid = kashport.mark_paid(kashport_id, meta={
+                    "auto_via": "relampago_api_v1_async_finalize",
+                    "relampago_tx_id": vtrx_id,
+                    "external_id": record.get("external_id"),
+                    "state": state,
+                    "finalized_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                })
+                if paid.get("ok"):
+                    # IDEMPOTENT update · solo si NO marcado antes (race protection)
+                    if storage.mark_kashport_finalized(vtrx_id, "paid"):
+                        out["marked_paid"] += 1
+                        log_event("kashport_finalized_paid", {
+                            "kashport_id": kashport_id,
+                            "relampago_tx_id": vtrx_id,
+                            "state": state,
+                            "amount_cop": record.get("amount_cop"),
+                        })
+                else:
+                    out["errors"].append({
+                        "vtrx": vtrx_id,
+                        "action": "mark_paid_failed",
+                        "kashport_response": paid,
+                    })
+                    log_event("kashport_mark_paid_failed", {
+                        "kashport_id": kashport_id,
+                        "relampago_tx_id": vtrx_id,
+                        "paid": paid,
+                    })
+            except Exception as e:
+                out["errors"].append({"vtrx": vtrx_id, "error": f"mark_paid_exception: {e}"})
+
+        elif state in RELAMPAGO_STATES_FINAL_FAIL:
+            # FINAL FAIL · mark Kashport rejected con motivo real Relampago
+            try:
+                reason = declination or "rejected_by_relampago"
+                detail = f"Relampago state={state} · declination={declination or 'sin detalle'}"
+                rej = kashport.mark_rejected(kashport_id, reason=reason, detail=detail)
+                if rej.get("ok"):
+                    if storage.mark_kashport_finalized(vtrx_id, "rejected"):
+                        out["marked_rejected"] += 1
+                        log_event("kashport_finalized_rejected", {
+                            "kashport_id": kashport_id,
+                            "relampago_tx_id": vtrx_id,
+                            "state": state,
+                            "declination": declination,
+                            "amount_cop": record.get("amount_cop"),
+                        })
+
+                        # Attention item para audit · severity warn (operator review)
+                        try:
+                            storage.add_attention(
+                                kind="rejected_by_relampago_async",
+                                severity="warn",
+                                relampago_tx_id=vtrx_id,
+                                external_id=record.get("external_id"),
+                                kashport_provider_id=record.get("kashport_provider_id"),
+                                payee_name=record.get("payee_name"),
+                                amount_cop=record.get("amount_cop"),
+                                description=(
+                                    f"Relampago rechazó dispersión · ${record.get('amount_cop'):,.0f} "
+                                    f"· state={state} · {declination or 'sin detalle'}"
+                                ),
+                                detail_json={
+                                    "vtrx_id": vtrx_id,
+                                    "kashport_id": kashport_id,
+                                    "state": state,
+                                    "declination": declination,
+                                    "trueno_match": trueno_match,
+                                },
+                            )
+                        except Exception:
+                            pass
+                else:
+                    out["errors"].append({
+                        "vtrx": vtrx_id,
+                        "action": "mark_rejected_failed",
+                        "kashport_response": rej,
+                    })
+            except Exception as e:
+                out["errors"].append({"vtrx": vtrx_id, "error": f"mark_rejected_exception: {e}"})
+
+        else:
+            # state intermedio (created · pending · etc) · still awaiting
+            out["still_awaiting"] += 1
+
+    return out
 
 
 def _trueno_sync_loop():

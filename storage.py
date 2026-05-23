@@ -177,6 +177,28 @@ def init_db():
         ]
         set_setting("alert_recipients", json.dumps(defaults_emails))
 
+    # ============ Migration · 2026-05-23 · two-phase Kashport finalize ============
+    # New flow · NO mark_paid Kashport inmediato post-execute_dispersion.
+    # Wait until trueno_sync detect Relampago state FINAL (approved/sent OR rejected).
+    # Solo entonces · kashport.mark_paid o mark_rejected.
+    # Columns para tracking:
+    #   · kashport_finalized · 0/1 · si Kashport ya marcado
+    #   · kashport_finalize_action · 'paid' | 'rejected' | NULL
+    #   · kashport_finalize_at · timestamp ISO cuando se marcó
+    #   · awaiting_since · epoch cuando entró a estado awaiting (para timeout)
+    with _cursor() as c:
+        for ddl in [
+            "ALTER TABLE sent_dispersions ADD COLUMN kashport_finalized INTEGER DEFAULT 0",
+            "ALTER TABLE sent_dispersions ADD COLUMN kashport_finalize_action TEXT",
+            "ALTER TABLE sent_dispersions ADD COLUMN kashport_finalize_at TEXT",
+            "ALTER TABLE sent_dispersions ADD COLUMN awaiting_since REAL",
+            "CREATE INDEX IF NOT EXISTS idx_sent_awaiting ON sent_dispersions(kashport_finalized, awaiting_since)",
+        ]:
+            try:
+                c.execute(ddl)
+            except Exception:
+                pass  # column / index ya existe
+
 
 # ============ app_settings (key/value) ============
 
@@ -273,6 +295,8 @@ def record_sent_dispersion(
     request_body: dict,
     response_body: dict,
 ):
+    """2026-05-23 · awaiting_since seteado · kashport_finalized=0 default.
+    Kashport mark happens later · cuando trueno_sync detect estado final Relampago."""
     now = time.time()
     iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
     with _cursor() as c:
@@ -281,14 +305,76 @@ def record_sent_dispersion(
             (ts_iso, ts_epoch, kashport_id, kashport_provider_id,
              relampago_tx_id, external_id, payee_name, payee_key, payee_doc, payee_bank,
              amount_cop, rail, initial_state, current_state,
-             request_json, response_json, last_state_check)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             request_json, response_json, last_state_check,
+             kashport_finalized, awaiting_since)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             iso, now, kashport_id, kashport_provider_id,
             relampago_tx_id, external_id, payee_name, payee_key, payee_doc, payee_bank,
             amount_cop, rail, initial_state, initial_state,
             json.dumps(request_body, default=str), json.dumps(response_body, default=str), now,
+            0, now,
         ))
+
+
+def get_sent_by_relampago_tx(relampago_tx_id: str) -> dict | None:
+    """2026-05-23 · lookup sent_dispersion por vtrx_id · retorna None si no existe."""
+    with _cursor() as c:
+        row = c.execute("""
+            SELECT * FROM sent_dispersions WHERE relampago_tx_id = ? LIMIT 1
+        """, (relampago_tx_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_sent_by_kashport_id(kashport_id: str) -> dict | None:
+    """2026-05-23 · lookup por kashport_id · útil dedup pre-execute."""
+    with _cursor() as c:
+        row = c.execute("""
+            SELECT * FROM sent_dispersions WHERE kashport_id = ? LIMIT 1
+        """, (kashport_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_awaiting_kashport_finalize() -> list:
+    """2026-05-23 · sent_dispersions sin kashport_finalized=0 · listas para evaluar finalize."""
+    with _cursor() as c:
+        rows = c.execute("""
+            SELECT * FROM sent_dispersions
+            WHERE kashport_finalized = 0
+            ORDER BY awaiting_since ASC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_kashport_finalized(relampago_tx_id: str, action: str) -> bool:
+    """2026-05-23 · marca Kashport finalize done · IDEMPOTENT.
+    action · 'paid' | 'rejected'
+    Solo UPDATE si kashport_finalized=0 actualmente · prevents double-mark race.
+    Returns True si efectivamente actualizó · False si ya estaba marcado."""
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    with _cursor() as c:
+        cur = c.execute("""
+            UPDATE sent_dispersions
+            SET kashport_finalized = 1,
+                kashport_finalize_action = ?,
+                kashport_finalize_at = ?
+            WHERE relampago_tx_id = ? AND kashport_finalized = 0
+        """, (action, iso, relampago_tx_id))
+        return cur.rowcount > 0
+
+
+def list_stale_awaiting(hours: int = 6) -> list:
+    """2026-05-23 · sent_dispersions awaiting > N hours · escalation candidates."""
+    cutoff = time.time() - (hours * 3600)
+    with _cursor() as c:
+        rows = c.execute("""
+            SELECT * FROM sent_dispersions
+            WHERE kashport_finalized = 0
+              AND awaiting_since IS NOT NULL
+              AND awaiting_since < ?
+            ORDER BY awaiting_since ASC
+        """, (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
 
 
 def list_sent_dispersions(limit: int = 100) -> list:

@@ -524,8 +524,7 @@ class RelampagoSession:
     def execute_dispersion(self, transfers: list) -> dict:
         """
         Ejecutar dispersión REAL.
-        NOTA · shape EXACTO TBD · necesitamos capturar de Network tab de Trueno una real.
-        Por ahora · placeholder con shape inferido del resolve-payee.
+        Relampago retorna HTTP 201 Created cuando OK · NO 200.
         """
         body = {"data": {"transfers": transfers}}
         try:
@@ -536,7 +535,7 @@ class RelampagoSession:
                 timeout=30,
             )
             return {
-                "ok": r.status_code == 200,
+                "ok": 200 <= r.status_code < 300,  # FIX · 201 también OK (Created)
                 "status": r.status_code,
                 "data": r.json() if r.text else None,
             }

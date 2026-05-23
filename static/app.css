@@ -156,9 +156,117 @@ header h1 { margin: 0; font-size: 18px; font-weight: 700; }
   padding-right: 4px;
 }
 
-@media (max-width: 800px) {
-  .app-shell { grid-template-columns: 60px 1fr; }
+/* ============ Mobile-first responsive ============ */
+/* Tablet · sidebar collapsed (icon-only) */
+@media (max-width: 900px) {
+  .app-shell { grid-template-columns: 56px 1fr; }
   .nav-link span:not(.nav-icon):not(.nav-badge) { display: none; }
+  .nav-link { justify-content: center; padding: 12px 8px; }
+  .nav-badge {
+    position: absolute; top: 4px; right: 4px;
+    margin-left: 0; min-width: 16px; padding: 1px 4px;
+    font-size: 9px;
+  }
+  .sidebar-footer { display: none; }
+  .content { padding: 14px 16px; }
+  header { padding: 10px 16px; flex-wrap: wrap; gap: 8px; }
+  header h1 { font-size: 15px; }
+  .status-row { font-size: 11px; gap: 6px; }
+  #google-user { display: none; }
+}
+
+/* Mobile · sidebar bottom bar */
+@media (max-width: 600px) {
+  body { font-size: 13px; }
+  .app-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+    height: calc(100vh - 80px);
+  }
+  .sidebar {
+    grid-row: 2;
+    border-right: none;
+    border-top: 1px solid #2e3a48;
+    padding: 4px 0;
+    background: #0a0e13;
+    z-index: 100;
+  }
+  .sidebar nav {
+    flex-direction: row;
+    justify-content: space-around;
+    padding: 0 4px;
+    overflow-x: auto;
+  }
+  .nav-link {
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 10px;
+    font-size: 9px;
+    min-width: 50px;
+    text-align: center;
+  }
+  .nav-link span:not(.nav-icon):not(.nav-badge) {
+    display: inline;
+    font-size: 9px;
+    line-height: 1;
+  }
+  .nav-icon { font-size: 18px; }
+  .nav-badge {
+    position: absolute; top: 2px; right: 4px;
+    font-size: 8px; min-width: 14px;
+  }
+
+  .content {
+    grid-row: 1;
+    height: calc(100vh - 130px);
+    padding: 10px 12px;
+  }
+
+  /* Cards · más compactos */
+  .card { padding: 12px; margin-bottom: 10px; }
+  .card.mini { padding: 10px; }
+  .card h3 { font-size: 13px; }
+  .subview h2 { font-size: 16px; flex-direction: column; align-items: flex-start; gap: 4px; }
+  .subview h2 .badge { font-size: 11px; }
+
+  /* Header siempre legible */
+  header h1 { font-size: 14px; }
+  .status-row span { font-size: 11px; }
+  #logout-btn, #logout-google { font-size: 10px; padding: 3px 6px; }
+
+  /* Queue item · stacked */
+  .queue-item, .sent-item, .trueno-item {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .qi-amount, .sent-amount { text-align: left; font-size: 16px; }
+  .qi-actions { flex-direction: column; gap: 6px; }
+  .qi-actions button { width: 100%; padding: 10px; font-size: 13px; }
+  .state-pill { font-size: 9px; padding: 2px 6px; }
+
+  /* Stats mini · 4 columnas pequeñas */
+  .stats-mini { grid-template-columns: repeat(4, 1fr); gap: 4px; }
+  .stats-mini > div { font-size: 10px; }
+  .stats-mini strong { font-size: 14px; }
+
+  /* Login screens · ajuste */
+  .view-centered { padding-top: 20px; }
+  .view.view-centered { padding: 20px 12px; }
+
+  /* Banner */
+  .banner { padding: 8px 12px; font-size: 12px; }
+
+  /* Threshold table · scroll horizontal */
+  .threshold-table { font-size: 10px; }
+  .threshold-table input[type="number"] { width: 100px; font-size: 11px; }
+
+  /* Inputs · touch friendly */
+  input[type="text"], input[type="email"], input[type="password"], input[type="number"] {
+    font-size: 16px;  /* iOS NO zoom · evita auto-zoom al focus */
+    padding: 10px 12px;
+  }
+  button { padding: 10px 14px; font-size: 14px; min-height: 40px; }
+  .btn-tiny { padding: 6px 10px; font-size: 11px; min-height: 32px; }
 }
 
 .card {

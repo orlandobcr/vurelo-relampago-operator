@@ -481,15 +481,49 @@ def api_process(item_id):
     # Step 1 · resolve-payee (validar llave)
     resolve = relampago.resolve_payee(key, virtual_amount_cents, routing=routing)
     if resolve.get("status") == 404:
-        # Llave inválida · auto-reject
-        log_event("payee_invalid", {"item_id": item_id, "key": key})
-        rej = kashport.mark_rejected(item_id, reason="payee_key_invalid", detail="Llave BREB no encontrada · validado vía Relampago API")
+        # Llave inválida · auto-reject + persistir en attention
+        d = item.get("destination") or {}
+        payee_name = d.get("fullname") or d.get("name") or "(sin nombre)"
+        doc = d.get("doc_number") or d.get("doc") or "?"
+
+        log_event("payee_invalid", {"item_id": item_id, "key": key, "payee": payee_name})
+        rej = kashport.mark_rejected(
+            item_id,
+            reason="payee_key_invalid",
+            detail="Llave BREB no encontrada · validado vía Relampago API",
+        )
         log_event("auto_rejected", {"item_id": item_id, "kashport_resp": rej})
+
+        # Persistir en attention_items para audit + review operador
+        try:
+            storage.add_attention(
+                kind="auto_rejected_payee_invalid",
+                severity="warn",
+                relampago_tx_id=None,
+                external_id=None,
+                kashport_provider_id=item.get("oldvprovider_id"),
+                payee_name=payee_name,
+                amount_cop=int(amount_cop_pesos),
+                description=f"Llave BREB inválida · {key} · {payee_name} (CC {doc}) · monto ${int(amount_cop_pesos):,.0f}",
+                detail_json={
+                    "kashport_id": item_id,
+                    "kashport_provider_id": item.get("oldvprovider_id"),
+                    "key_tried": key,
+                    "amount_cop": int(amount_cop_pesos),
+                    "rail": routing,
+                    "payee_doc": doc,
+                    "resolve_response": resolve.get("data"),
+                    "kashport_reject_result": rej,
+                },
+            )
+        except Exception as e:
+            log_event("attention_persist_error", {"error": str(e)})
+
         return jsonify({
             "ok": False,
             "auto_rejected": True,
             "key": key,
-            "message": "Llave inválida · auto-rechazada · refund al user",
+            "message": "Llave inválida · auto-rechazada · refund al user · agregada a Atención",
             "resolve": resolve,
             "kashport_reject": rej,
         })

@@ -37,8 +37,9 @@ class RelampagoSession:
 
     # Constants
     TOKEN_LIFETIME_S = 600        # 10 min · access_token Max-Age
-    REFRESH_LEAD_S = 60           # intentar refresh 60s antes del expire
-    REFRESH_RETRY_S = 30          # si "not ready" · reintentar en 30s
+    REFRESH_LEAD_S = 180          # 3 min de margen · empezar a INTENTAR refresh
+    REFRESH_RETRY_S = 10          # si "not ready" · reintentar cada 10s (era 30)
+    CRITICAL_THRESHOLD_S = 30     # si quedan <30s · log alerta · refresh muy próximo
 
     def __init__(self):
         self.session = requests.Session()
@@ -258,23 +259,38 @@ class RelampagoSession:
 
     def _refresh_loop(self):
         """
-        Monitor continuo del token · refresh JUSTO antes de que expire.
-        Estrategia:
-          1. PRIMER check INMEDIATO (sin esperar el intervalo · cubre post-startup)
-          2. Sleep 15s entre checks
-          3. Si quedan <= REFRESH_LEAD_S (60s) · intentar refresh
-          4. Si server dice "not ready" · esperar REFRESH_RETRY_S y reintentar
-          5. Si todavía no ready y quedan <30s · loop frenético cada 10s
-          6. Si expira o 401 · marcar logged_out · stop loop
+        Monitor continuo del token · refresh con margen GRANDE.
+        Estrategia mejorada · NUNCA dejar que la sesión muera por timing:
+
+          · LEAD 180s · empezamos a INTENTAR refresh 3 minutos antes del expire
+          · Si server dice "not ready" · retry cada 10s (no espera 30s)
+          · Si quedan <60s · loop FRENÉTICO · cada 5s
+          · Si quedan <30s · alerta crítica + retry cada 3s
+          · Si quedan <10s · último-recurso · retry cada 1s
+          · Si llega a 0 sin refresh · sesión muerta
+
+          CHECK_INTERVAL dinámico · más rápido mientras más cerca del expire.
         """
-        CHECK_INTERVAL = 15  # cada 15s · más resolución (era 30s)
         first_iteration = True
         while not self._refresh_stop.is_set():
-            # Primer check sin esperar (cubre el caso post-startup que el token esté cerca expire)
+            # Primer check inmediato post-startup
             if not first_iteration:
-                if self._refresh_stop.wait(CHECK_INTERVAL):
+                # Sleep dinámico · empezamos con 15s · y se acorta cerca del expire
+                remaining_for_sleep = (self._token_expires_at or 0) - time.time()
+                if remaining_for_sleep > self.REFRESH_LEAD_S + 60:
+                    sleep_s = 15  # token aún lejos
+                elif remaining_for_sleep > 60:
+                    sleep_s = 10  # en ventana de refresh · check más rápido
+                elif remaining_for_sleep > 30:
+                    sleep_s = 5   # crítico · cada 5s
+                elif remaining_for_sleep > 10:
+                    sleep_s = 3   # muy crítico · cada 3s
+                else:
+                    sleep_s = 1   # ULTIMO RECURSO · cada 1s
+                if self._refresh_stop.wait(sleep_s):
                     break
             first_iteration = False
+
             if not self._logged_in:
                 break
             if not self._token_expires_at:
@@ -282,29 +298,24 @@ class RelampagoSession:
 
             seconds_remaining = self._token_expires_at - time.time()
 
-            # Token expirado · sesión perdida (algo falló)
+            # Token expirado · sesión perdida
             if seconds_remaining <= 0:
+                print(f"⚠⚠⚠ SESIÓN PERDIDA · token expiró sin refresh exitoso · refresh_count={self._refresh_count}")
                 self._logged_in = False
                 self._refresh_errors += 1
                 break
 
-            # Refresh window · quedan <= LEAD seconds · intentar
+            # Refresh window · quedan <= LEAD (180s) · intentar
             if seconds_remaining <= self.REFRESH_LEAD_S:
                 ok = self._do_refresh()
                 if ok:
-                    continue  # Token renovado · seguir monitor
-                # No ready o error · retry shortly
-                # Si quedan <30s · loop más rápido
-                retry_in = min(self.REFRESH_RETRY_S, max(5, int(seconds_remaining) // 2))
-                if self._refresh_stop.wait(retry_in):
-                    break
-                ok2 = self._do_refresh()
-                if not ok2 and (self._token_expires_at - time.time()) <= 10:
-                    # Crítico · token a 10s de expirar y refresh sigue fallando
-                    # Marcar sesión perdida · UI deberá re-login
-                    self._logged_in = False
-                    self._refresh_errors += 1
-                    break
+                    # Token renovado · log y seguir
+                    new_remaining = self._token_expires_at - time.time()
+                    print(f"✓ Refresh OK · refresh_count={self._refresh_count} · nuevo token expira en {int(new_remaining)}s")
+                    continue
+                # No ready · retry rápido (el loop arriba ajusta CHECK_INTERVAL según urgencia)
+                if seconds_remaining <= self.CRITICAL_THRESHOLD_S:
+                    print(f"⚠ refresh '{seconds_remaining:.0f}s' antes de expire falló · re-intentando agresivamente")
 
     def _do_refresh(self) -> bool:
         """

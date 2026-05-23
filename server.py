@@ -564,9 +564,13 @@ def api_process(item_id):
 
 @app.route("/api/reject/<item_id>", methods=["POST"])
 def api_reject(item_id):
+    """
+    Manual reject desde UI · POST sin body a Kashport (igual extension v0.3).
+    Si llega un body con reason · pasarlo (caso edge donde se especifica razón).
+    """
     body = request.get_json(force=True, silent=True) or {}
-    reason = body.get("reason", "manual_reject")
-    detail = body.get("detail", "Rechazado manualmente desde Vurelo Operator")
+    reason = body.get("reason", "")  # vacío default · igual a extension
+    detail = body.get("detail", "")
     result = kashport.mark_rejected(item_id, reason=reason, detail=detail)
     if result.get("ok"):
         COMPLETED_IDS.add(item_id)

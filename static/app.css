@@ -177,19 +177,31 @@ header h1 { margin: 0; font-size: 18px; font-weight: 700; }
 
 /* Mobile · sidebar bottom bar */
 @media (max-width: 600px) {
-  body { font-size: 13px; }
+  body {
+    font-size: 13px;
+    /* Asegurar background hasta el bottom incluyendo safe area */
+    background: #0e1419;
+    /* Prevenir scroll bounce iOS que muestra background blanco */
+    overscroll-behavior: none;
+  }
   .app-shell {
     grid-template-columns: 1fr;
     grid-template-rows: 1fr auto;
-    height: calc(100vh - 80px);
+    /* Usar dynamic viewport units cuando disponibles · sino fallback 100vh */
+    height: 100vh;
+    height: 100dvh;
   }
   .sidebar {
     grid-row: 2;
     border-right: none;
     border-top: 1px solid #2e3a48;
-    padding: 4px 0;
+    /* Respect safe area iPhone home indicator + Android navigation bar */
+    padding: 4px 0 calc(4px + env(safe-area-inset-bottom, 0px)) 0;
     background: #0a0e13;
     z-index: 100;
+    /* Asegurar que se queda pegado al bottom incluso con keyboard open */
+    position: sticky;
+    bottom: 0;
   }
   .sidebar nav {
     flex-direction: row;
@@ -218,8 +230,19 @@ header h1 { margin: 0; font-size: 18px; font-weight: 700; }
 
   .content {
     grid-row: 1;
-    height: calc(100vh - 130px);
+    /* Auto-fit · grid-template-rows: 1fr auto ya maneja altura · solo limit overflow */
+    overflow-y: auto;
     padding: 10px 12px;
+    /* Bottom padding extra · evita que cards últimos queden cerca del bottom bar */
+    padding-bottom: 16px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Safe area también para header top (notch iPhone) */
+  header {
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    padding-left: calc(16px + env(safe-area-inset-left, 0px));
+    padding-right: calc(16px + env(safe-area-inset-right, 0px));
   }
 
   /* Cards · más compactos */

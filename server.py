@@ -233,6 +233,32 @@ def api_logout():
     return jsonify({"ok": True})
 
 
+@app.route("/api/refresh-history")
+def api_refresh_history():
+    """
+    Diagnostic 2026-05-23 · ver patrón refresh para entender cuándo/por qué se cierra sesión.
+    Retorna last 50 refresh events · cada uno con timestamp · status · cookies rotated.
+    Útil para detectar:
+       · Cognito refresh_token expiry (~30 días post-login fresh)
+       · Network errors patterns (NETWORK_ERROR consecutivos)
+       · Server-side revoke (REVOKED status code 401/403)
+       · Cookie rotation issues (access_token_rotated=false en OK · server NO rotó)
+    """
+    return jsonify({
+        "history": relampago.refresh_history,
+        "summary": {
+            "total_events": len(relampago.refresh_history),
+            "session_started_iso": relampago.status.get("session_started_iso"),
+            "session_age_hours": relampago.status.get("session_age_hours"),
+            "session_age_days": relampago.status.get("session_age_days"),
+            "cognito_refresh_token_days_left": relampago.status.get("cognito_refresh_token_days_left"),
+            "refresh_count": relampago._refresh_count,
+            "refresh_errors": relampago._refresh_errors,
+            "consecutive_errors": relampago._consecutive_errors,
+        },
+    })
+
+
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     result = relampago.force_refresh()

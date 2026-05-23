@@ -61,6 +61,11 @@ class RelampagoSession:
         self._refresh_count = 0
         self._refresh_errors = 0
         self._consecutive_errors = 0
+        # Diagnostic 2026-05-23 · capturar patrón refresh
+        self._refresh_history = []  # last 50 events · (ts_iso, status, cookies_rotated, expires_in)
+        self._session_started_at = None  # epoch · cuando se hizo login_exchange
+        self._cookie_access_token_value = None  # para detectar si rotó
+        self._cookie_session_id_value = None
 
     # ============ State helpers ============
 
@@ -80,9 +85,29 @@ class RelampagoSession:
         seconds_to_expire = None
         if self._token_expires_at:
             seconds_to_expire = max(0, int(self._token_expires_at - time.time()))
+
+        # Diagnostic 2026-05-23 · session age + Cognito refresh_token age estimate
+        session_age_hours = None
+        session_age_days = None
+        if self._session_started_at:
+            session_age_s = time.time() - self._session_started_at
+            session_age_hours = round(session_age_s / 3600, 2)
+            session_age_days = round(session_age_s / 86400, 2)
+
+        # Cognito refresh_token TTL default 30d · estimar tiempo restante
+        cognito_refresh_token_days_left = None
+        if self._session_started_at:
+            elapsed_days = (time.time() - self._session_started_at) / 86400
+            cognito_refresh_token_days_left = round(30 - elapsed_days, 2)
+
         return {
             "logged_in": self.is_logged_in,
             "email": self._last_login_email,
+            "session_started_at": self._session_started_at,
+            "session_started_iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._session_started_at)) if self._session_started_at else None,
+            "session_age_hours": session_age_hours,
+            "session_age_days": session_age_days,
+            "cognito_refresh_token_days_left": cognito_refresh_token_days_left,
             "last_refresh": self._last_refresh,
             "last_refresh_iso": time.strftime("%H:%M:%S", time.localtime(self._last_refresh)) if self._last_refresh else None,
             "token_expires_at": self._token_expires_at,
@@ -90,8 +115,17 @@ class RelampagoSession:
             "refresh_running": self._refresh_thread is not None and self._refresh_thread.is_alive(),
             "refresh_count": self._refresh_count,
             "refresh_errors": self._refresh_errors,
+            "consecutive_errors": self._consecutive_errors,
             "cookies": [c.name for c in self.session.cookies],
+            # Diagnostic 2026-05-23 · ¿cookie rotó en último refresh?
+            "cookie_access_token_last_chars": (self._cookie_access_token_value[-8:] if self._cookie_access_token_value else None),
+            "cookie_session_id_last_chars": (self._cookie_session_id_value[-8:] if self._cookie_session_id_value else None),
         }
+
+    @property
+    def refresh_history(self) -> list:
+        """Last 50 refresh events · for diagnostic /api/refresh-history endpoint."""
+        return list(self._refresh_history)
 
     # ============ Login flow · 3 pasos ============
 
@@ -236,6 +270,16 @@ class RelampagoSession:
         self._mfa_url = None
         self._pending_email = None
         self._consecutive_errors = 0
+        # Diagnostic 2026-05-23 · track Cognito refresh_token TTL (30d default)
+        self._session_started_at = time.time()
+        self._cookie_access_token_value = self.session.cookies.get("access_token")
+        self._cookie_session_id_value = self.session.cookies.get("session_id")
+        self._add_history({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "LOGIN_FRESH",
+            "email": self._last_login_email,
+            "expires_in": expires_in,
+        })
 
         # Persistir sesión inmediatamente · sobrevive restart
         self.persist_to_storage()
@@ -333,10 +377,19 @@ class RelampagoSession:
                     headers={"Content-Type": "application/json"},
                     timeout=10,
                 )
-            except Exception:
+            except Exception as e:
                 self._refresh_errors += 1
+                self._consecutive_errors += 1
+                self._add_history({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "NETWORK_ERROR",
+                    "error": str(e)[:200],
+                    "refresh_count": self._refresh_count,
+                    "consecutive_errors": self._consecutive_errors,
+                })
                 return False
 
+            ts_iso = time.strftime("%Y-%m-%d %H:%M:%S")
             if r.status_code == 200:
                 # Cookies access_token + session_id ya están en self.session.cookies
                 self._last_refresh = time.time()
@@ -349,16 +402,48 @@ class RelampagoSession:
                 self._token_expires_at = time.time() + expires_in
                 self._refresh_count += 1
                 self._consecutive_errors = 0
+
+                # Diagnostic 2026-05-23 · detectar si cookies realmente rotaron
+                new_access = self.session.cookies.get("access_token")
+                new_session = self.session.cookies.get("session_id")
+                access_rotated = new_access != self._cookie_access_token_value
+                session_rotated = new_session != self._cookie_session_id_value
+                self._cookie_access_token_value = new_access
+                self._cookie_session_id_value = new_session
+
+                self._add_history({
+                    "ts": ts_iso,
+                    "status": "OK",
+                    "http_code": 200,
+                    "expires_in": expires_in,
+                    "refresh_count": self._refresh_count,
+                    "access_token_rotated": access_rotated,
+                    "session_id_rotated": session_rotated,
+                })
+
                 # Persist actualizado a SQLite · sobrevive restarts
                 self.persist_to_storage()
                 return True
             if r.status_code == 400:
                 # "Token not ready for refresh" · normal · esperar y retry
+                self._add_history({
+                    "ts": ts_iso,
+                    "status": "RETRY_NEEDED",
+                    "http_code": 400,
+                    "refresh_count": self._refresh_count,
+                })
                 return False
             if r.status_code in (401, 403):
                 self._logged_in = False
                 self._refresh_errors += 1
                 self._consecutive_errors += 1
+                self._add_history({
+                    "ts": ts_iso,
+                    "status": "REVOKED",
+                    "http_code": r.status_code,
+                    "refresh_count": self._refresh_count,
+                    "consecutive_errors": self._consecutive_errors,
+                })
                 if storage is not None:
                     try:
                         storage.clear_session()
@@ -367,7 +452,20 @@ class RelampagoSession:
                 return False
             self._refresh_errors += 1
             self._consecutive_errors += 1
+            self._add_history({
+                "ts": ts_iso,
+                "status": "OTHER_ERROR",
+                "http_code": r.status_code,
+                "refresh_count": self._refresh_count,
+                "consecutive_errors": self._consecutive_errors,
+            })
             return False
+
+    def _add_history(self, event: dict) -> None:
+        """Add to refresh_history · keep max 50 events."""
+        self._refresh_history.append(event)
+        if len(self._refresh_history) > 50:
+            self._refresh_history = self._refresh_history[-50:]
 
     def force_refresh(self) -> dict:
         """Forzar un refresh manual (para UI)."""

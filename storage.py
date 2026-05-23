@@ -59,7 +59,8 @@ def init_db():
             last_refresh     REAL,
             token_expires_at REAL,
             refresh_count    INTEGER DEFAULT 0,
-            updated_at       REAL
+            updated_at       REAL,
+            session_started_at REAL         -- 2026-05-23 · Cognito refresh_token age tracking
         );
 
         CREATE TABLE IF NOT EXISTS balance_thresholds (
@@ -201,28 +202,44 @@ def delete_setting(key: str):
 # ============ session_state (single-row · upsert) ============
 
 def save_session(cookies: dict, email: str, last_refresh: float,
-                 token_expires_at: float, refresh_count: int):
-    """Persist session state to SQLite (single row, id=1)."""
+                 token_expires_at: float, refresh_count: int,
+                 session_started_at: float = None):
+    """Persist session state to SQLite (single row, id=1).
+    2026-05-23 · session_started_at agregado para tracking Cognito refresh_token TTL.
+    Auto-add column si schema viejo (migration in-place)."""
     with _cursor() as c:
+        # In-place migration · agregar column si NO existe (idempotente)
+        try:
+            c.execute("ALTER TABLE session_state ADD COLUMN session_started_at REAL")
+        except Exception:
+            pass  # column ya existe
         c.execute("""
             INSERT INTO session_state
-            (id, cookies_json, email, last_refresh, token_expires_at, refresh_count, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?)
+            (id, cookies_json, email, last_refresh, token_expires_at, refresh_count, updated_at, session_started_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                cookies_json     = excluded.cookies_json,
-                email            = excluded.email,
-                last_refresh     = excluded.last_refresh,
-                token_expires_at = excluded.token_expires_at,
-                refresh_count    = excluded.refresh_count,
-                updated_at       = excluded.updated_at
-        """, (json.dumps(cookies, default=str), email, last_refresh, token_expires_at, refresh_count, time.time()))
+                cookies_json       = excluded.cookies_json,
+                email              = excluded.email,
+                last_refresh       = excluded.last_refresh,
+                token_expires_at   = excluded.token_expires_at,
+                refresh_count      = excluded.refresh_count,
+                updated_at         = excluded.updated_at,
+                session_started_at = COALESCE(excluded.session_started_at, session_state.session_started_at)
+        """, (json.dumps(cookies, default=str), email, last_refresh, token_expires_at,
+              refresh_count, time.time(), session_started_at))
 
 
 def load_session() -> dict:
     with _cursor() as c:
+        # In-place migration · agregar column si NO existe (idempotente · safe en restart)
+        try:
+            c.execute("ALTER TABLE session_state ADD COLUMN session_started_at REAL")
+        except Exception:
+            pass  # column ya existe
         row = c.execute("SELECT * FROM session_state WHERE id = 1").fetchone()
         if not row:
             return None
+        keys = row.keys()
         return {
             "cookies": json.loads(row["cookies_json"]) if row["cookies_json"] else {},
             "email": row["email"],
@@ -230,6 +247,7 @@ def load_session() -> dict:
             "token_expires_at": row["token_expires_at"],
             "refresh_count": row["refresh_count"] or 0,
             "updated_at": row["updated_at"],
+            "session_started_at": row["session_started_at"] if "session_started_at" in keys else None,
         }
 
 

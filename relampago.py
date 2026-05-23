@@ -44,20 +44,34 @@ class RelampagoSession:
     REFRESH_MAX_RETRIES = 3       # max 3 intentos · luego logout
 
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
+        # ============ ARCHITECTURE FIX 2026-05-23 · dual session encapsulation ============
+        # User principle · "TODA la lógica de refresh en el service · NO depender de UI"
+        # Pre-fix · self.session (única) compartida entre refresh thread + 5 threads ops
+        #          requests.Session NO thread-safe · race conditions · 36% fail rate.
+        # Post-fix · 2 sessions internas:
+        #   _session_auth · USADA SOLO por refresh thread + login (thread-isolated)
+        #   _session_ops  · USADA por TODOS los ops (queries · dispersions · balance)
+        #                   cookies sync'd atomic desde _session_auth post-refresh OK
+        # Lock UNIVERSAL en TODOS los métodos públicos para serializar acceso.
+        # `self.session` se mantiene como property read-only · backward-compat con
+        # código externo (server.py auto_loop · trueno_sync) durante migration.
+        self._session_auth = requests.Session()
+        self._session_ops = requests.Session()
+        _headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh) AppleWebKit/537.36",
             "Origin": ORIGIN,
             "Referer": f"{ORIGIN}/",
             "Accept": "application/json, text/plain, */*",
-        })
+        }
+        self._session_auth.headers.update(_headers)
+        self._session_ops.headers.update(_headers)
         self._refresh_thread = None
         self._refresh_stop = threading.Event()
         self._logged_in = False
         self._last_refresh = None             # timestamp last successful refresh/exchange
         self._token_expires_at = None         # epoch · cuándo expira access_token
         self._last_login_email = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()        # RLock · permite recursion (verify→refresh→sync)
         self._refresh_count = 0
         self._refresh_errors = 0
         self._consecutive_errors = 0
@@ -70,15 +84,37 @@ class RelampagoSession:
     # ============ State helpers ============
 
     @property
+    def session(self):
+        """Backward-compat · expone _session_ops como read-only.
+        Code externo (server.py) que llamaba self.session.get debe migrar a método servicio.
+        En migración mientras refactor server.py · esta property mantiene compat.
+        WARNING · NO mutar cookies directo · usar refresh interno del service."""
+        return self._session_ops
+
+    @property
     def is_logged_in(self) -> bool:
-        return self._logged_in and "access_token" in self.session.cookies
+        return self._logged_in and "access_token" in self._session_ops.cookies
 
     @property
     def cookies_summary(self) -> dict:
         return {
             c.name: f"{c.value[:25]}... ({len(c.value)} chars)"
-            for c in self.session.cookies
+            for c in self._session_ops.cookies
         }
+
+    def _sync_cookies_to_ops(self) -> None:
+        """Copy cookies de _session_auth a _session_ops atómicamente.
+        Llamar solo DENTRO de self._lock · post-refresh OK."""
+        # Clear ops cookies first · then copy from auth (atomic replacement effect)
+        # NOTE · NO hacemos `_session_ops.cookies.clear()` antes para evitar
+        #        ventana donde ops queda SIN cookies si refresh thread cae.
+        #        Mejor copy individual · cookie por cookie · más resiliente.
+        for c in self._session_auth.cookies:
+            self._session_ops.cookies.set(
+                c.name, c.value,
+                domain=c.domain,
+                path=c.path,
+            )
 
     @property
     def status(self) -> dict:
@@ -116,7 +152,7 @@ class RelampagoSession:
             "refresh_count": self._refresh_count,
             "refresh_errors": self._refresh_errors,
             "consecutive_errors": self._consecutive_errors,
-            "cookies": [c.name for c in self.session.cookies],
+            "cookies": [c.name for c in self._session_ops.cookies],
             # Diagnostic 2026-05-23 · ¿cookie rotó en último refresh?
             "cookie_access_token_last_chars": (self._cookie_access_token_value[-8:] if self._cookie_access_token_value else None),
             "cookie_session_id_last_chars": (self._cookie_session_id_value[-8:] if self._cookie_session_id_value else None),
@@ -140,11 +176,12 @@ class RelampagoSession:
             f"&scope=email+openid+profile&redirect_uri={REDIRECT_URI}"
         )
 
-        # Reset cookies prev
-        self.session.cookies.clear()
+        # Reset cookies prev · ambas sessions (login fresh)
+        self._session_auth.cookies.clear()
+        self._session_ops.cookies.clear()
 
         try:
-            r = self.session.get(login_url, timeout=10)
+            r = self._session_auth.get(login_url, timeout=10)
             csrf_m = re.search(r'name="csrf" value="([^"]+)"', r.text)
             if not csrf_m:
                 return {"ok": False, "error": "no_csrf_token", "message": "No se encontró CSRF en login page"}
@@ -153,7 +190,7 @@ class RelampagoSession:
             return {"ok": False, "error": "network_error", "message": f"GET login page falló · {e}"}
 
         try:
-            r2 = self.session.post(
+            r2 = self._session_auth.post(
                 login_url,
                 data={
                     "csrf": csrf,
@@ -203,7 +240,7 @@ class RelampagoSession:
             return {"ok": False, "error": "no_pending_mfa", "message": "No hay login en progreso"}
 
         try:
-            r3 = self.session.get(self._mfa_url, timeout=10)
+            r3 = self._session_auth.get(self._mfa_url, timeout=10)
             csrf_m = re.search(r'name="csrf" value="([^"]+)"', r3.text)
             if not csrf_m:
                 return {"ok": False, "error": "no_csrf_mfa", "message": "No CSRF en MFA page"}
@@ -212,7 +249,7 @@ class RelampagoSession:
             return {"ok": False, "error": "network_error", "message": str(e)}
 
         try:
-            r4 = self.session.post(
+            r4 = self._session_auth.post(
                 self._mfa_url,
                 data={"csrf": csrf2, "code": pin, "cognitoAsfData": ""},
                 headers={
@@ -242,7 +279,7 @@ class RelampagoSession:
 
         # Paso 3 · exchange
         try:
-            r5 = self.session.post(
+            r5 = self._session_auth.post(
                 f"{API_BASE}/auth/exchange",
                 json={"authorizationCode": code},
                 headers={"Content-Type": "application/json"},
@@ -259,7 +296,7 @@ class RelampagoSession:
             }
 
         # Verificar access_token cookie
-        if "access_token" not in self.session.cookies:
+        if "access_token" not in self._session_auth.cookies:
             return {"ok": False, "error": "no_access_token", "message": "Exchange OK pero NO se seteó access_token cookie"}
 
         self._logged_in = True
@@ -272,8 +309,11 @@ class RelampagoSession:
         self._consecutive_errors = 0
         # Diagnostic 2026-05-23 · track Cognito refresh_token TTL (30d default)
         self._session_started_at = time.time()
-        self._cookie_access_token_value = self.session.cookies.get("access_token")
-        self._cookie_session_id_value = self.session.cookies.get("session_id")
+        # Sync auth cookies to ops session (atomic post-login fresh)
+        with self._lock:
+            self._sync_cookies_to_ops()
+        self._cookie_access_token_value = self._session_auth.cookies.get("access_token")
+        self._cookie_session_id_value = self._session_auth.cookies.get("session_id")
         self._add_history({
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "status": "LOGIN_FRESH",
@@ -317,51 +357,74 @@ class RelampagoSession:
 
         Esto NO satura el server · genera 1 llamada cada ~10min (normal)
         o max 3 si hay reintentos · muy ligero footprint.
+
+        ARCHITECTURE FIX 2026-05-23 · try/except outer · sobrevive cualquier
+        exception interna (time.sleep · print · etc) que antes mataba el thread silente.
         """
-        while not self._refresh_stop.is_set():
-            if not self._logged_in or not self._token_expires_at:
-                break
+        try:
+            while not self._refresh_stop.is_set():
+                try:
+                    if not self._logged_in or not self._token_expires_at:
+                        break
 
-            # Calcular cuánto esperar · refresh a 10s antes del expire
-            wait_until_refresh = self._token_expires_at - time.time() - self.REFRESH_LEAD_S
+                    # Calcular cuánto esperar · refresh a 10s antes del expire
+                    wait_until_refresh = self._token_expires_at - time.time() - self.REFRESH_LEAD_S
 
-            if wait_until_refresh > 0:
-                # Sleep hasta el momento exacto · NO loop checks
-                if self._refresh_stop.wait(wait_until_refresh):
-                    break
-            # Si llegamos aquí · es hora de refresh
+                    if wait_until_refresh > 0:
+                        # Sleep hasta el momento exacto · NO loop checks
+                        if self._refresh_stop.wait(wait_until_refresh):
+                            break
+                    # Si llegamos aquí · es hora de refresh
 
-            # Intentar refresh · max REFRESH_MAX_RETRIES con espaciado RETRY_S
-            success = False
-            for attempt in range(1, self.REFRESH_MAX_RETRIES + 1):
-                if self._refresh_stop.is_set():
-                    return
-                ok = self._do_refresh()
-                if ok:
-                    new_remaining = self._token_expires_at - time.time()
-                    print(f"✓ Refresh OK · count={self._refresh_count} · nuevo token expira en {int(new_remaining)}s (attempt {attempt})")
-                    success = True
-                    break
-                # Retry · esperar RETRY_S antes del próximo
-                remaining = self._token_expires_at - time.time()
-                if remaining <= 0:
-                    print(f"⚠⚠⚠ Token expiró durante retries · sesión perdida")
-                    break
-                print(f"⚠ Refresh attempt {attempt}/{self.REFRESH_MAX_RETRIES} falló (token quedan {int(remaining)}s) · retry en {self.REFRESH_RETRY_S}s")
-                if self._refresh_stop.wait(self.REFRESH_RETRY_S):
-                    return
+                    # Intentar refresh · max REFRESH_MAX_RETRIES con espaciado RETRY_S
+                    success = False
+                    for attempt in range(1, self.REFRESH_MAX_RETRIES + 1):
+                        if self._refresh_stop.is_set():
+                            return
+                        ok = self._do_refresh()
+                        if ok:
+                            new_remaining = self._token_expires_at - time.time()
+                            print(f"✓ Refresh OK · count={self._refresh_count} · nuevo token expira en {int(new_remaining)}s (attempt {attempt})")
+                            success = True
+                            break
+                        # Retry · esperar RETRY_S antes del próximo
+                        remaining = self._token_expires_at - time.time()
+                        if remaining <= 0:
+                            print(f"⚠⚠⚠ Token expiró durante retries · sesión perdida")
+                            break
+                        print(f"⚠ Refresh attempt {attempt}/{self.REFRESH_MAX_RETRIES} falló (token quedan {int(remaining)}s) · retry en {self.REFRESH_RETRY_S}s")
+                        if self._refresh_stop.wait(self.REFRESH_RETRY_S):
+                            return
 
-            if not success:
-                # Todos los retries fallaron · logout (igual frontend Relampago)
-                print(f"⚠⚠⚠ SESIÓN PERDIDA · {self.REFRESH_MAX_RETRIES} refresh attempts fallaron")
-                self._logged_in = False
-                self._refresh_errors += 1
-                if storage is not None:
-                    try:
-                        storage.clear_session()
-                    except Exception:
-                        pass
-                break
+                    if not success:
+                        # Todos los retries fallaron · logout (igual frontend Relampago)
+                        print(f"⚠⚠⚠ SESIÓN PERDIDA · {self.REFRESH_MAX_RETRIES} refresh attempts fallaron")
+                        self._logged_in = False
+                        self._refresh_errors += 1
+                        if storage is not None:
+                            try:
+                                storage.clear_session()
+                            except Exception:
+                                pass
+                        break
+                except Exception as inner_e:
+                    # Inner exception · log + continúa al próximo cycle (NO mata thread)
+                    print(f"⚠ Refresh loop inner exception · {inner_e} · sleeping 30s antes de retry")
+                    self._add_history({
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "INNER_EXCEPTION",
+                        "error": str(inner_e)[:200],
+                    })
+                    if self._refresh_stop.wait(30):
+                        break
+        except Exception as outer_e:
+            # Outer exception · catastrófico · log + permite restart manual
+            print(f"⚠⚠⚠ Refresh loop OUTER exception · thread terminating · {outer_e}")
+            self._add_history({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "OUTER_EXCEPTION",
+                "error": str(outer_e)[:200],
+            })
 
     def _do_refresh(self) -> bool:
         """
@@ -371,7 +434,7 @@ class RelampagoSession:
         """
         with self._lock:
             try:
-                r = self.session.post(
+                r = self._session_auth.post(
                     f"{API_BASE}/auth/refresh",
                     json={},
                     headers={"Content-Type": "application/json"},
@@ -404,8 +467,10 @@ class RelampagoSession:
                 self._consecutive_errors = 0
 
                 # Diagnostic 2026-05-23 · detectar si cookies realmente rotaron
-                new_access = self.session.cookies.get("access_token")
-                new_session = self.session.cookies.get("session_id")
+                # Sync cookies from auth → ops atomic (POST refresh OK)
+                self._sync_cookies_to_ops()
+                new_access = self._session_auth.cookies.get("access_token")
+                new_session = self._session_auth.cookies.get("session_id")
                 access_rotated = new_access != self._cookie_access_token_value
                 session_rotated = new_session != self._cookie_session_id_value
                 self._cookie_access_token_value = new_access
@@ -481,7 +546,7 @@ class RelampagoSession:
         try:
             cookies_dict = {
                 c.name: {"value": c.value, "domain": c.domain, "path": c.path}
-                for c in self.session.cookies
+                for c in self._session_auth.cookies
             }
             storage.save_session(
                 cookies=cookies_dict,
@@ -489,6 +554,7 @@ class RelampagoSession:
                 last_refresh=self._last_refresh or 0,
                 token_expires_at=self._token_expires_at or 0,
                 refresh_count=self._refresh_count,
+                session_started_at=self._session_started_at,
             )
         except Exception:
             pass
@@ -505,18 +571,25 @@ class RelampagoSession:
             data = storage.load_session()
             if not data or not data.get("cookies"):
                 return False
-            # Load cookies a self.session
+            # Load cookies a _session_auth · luego sync ops
             for name, info in data["cookies"].items():
-                self.session.cookies.set(
+                self._session_auth.cookies.set(
                     name,
                     info["value"],
                     domain=info.get("domain"),
                     path=info.get("path", "/"),
                 )
+            # Sync cookies a _session_ops (atómico bajo lock)
+            with self._lock:
+                self._sync_cookies_to_ops()
             self._last_login_email = data.get("email")
             self._last_refresh = data.get("last_refresh")
             self._token_expires_at = data.get("token_expires_at")
             self._refresh_count = data.get("refresh_count", 0)
+            # Restaurar session_started_at si está persistido
+            sa = data.get("session_started_at")
+            if sa:
+                self._session_started_at = sa
             return True
         except Exception:
             return False
@@ -532,10 +605,11 @@ class RelampagoSession:
         post-redeploy donde el container arranca con token casi expirado y el
         loop normal (que espera 30s entre checks) no alcanza a refrescar.
         """
-        if "access_token" not in self.session.cookies:
+        if "access_token" not in self._session_ops.cookies:
             return False
         try:
-            r = self.session.get(f"{API_BASE}/account/balance", timeout=8)
+            with self._lock:
+                r = self._session_ops.get(f"{API_BASE}/account/balance", timeout=8)
             if r.status_code == 200:
                 self._logged_in = True
                 if not self._token_expires_at:
@@ -552,7 +626,8 @@ class RelampagoSession:
                 return True
             elif r.status_code in (401, 403):
                 # Sesión muerta · limpiar
-                self.session.cookies.clear()
+                self._session_auth.cookies.clear()
+                self._session_ops.cookies.clear()
                 self._logged_in = False
                 if storage is not None:
                     try:
@@ -566,11 +641,13 @@ class RelampagoSession:
 
     def logout(self):
         try:
-            self.session.post(f"{API_BASE}/auth/logout", timeout=5)
+            self._session_auth.post(f"{API_BASE}/auth/logout", timeout=5)
         except Exception:
             pass
         self._refresh_stop.set()
-        self.session.cookies.clear()
+        with self._lock:
+            self._session_auth.cookies.clear()
+            self._session_ops.cookies.clear()
         self._logged_in = False
         self._last_login_email = None
         self._token_expires_at = None
@@ -587,23 +664,44 @@ class RelampagoSession:
         if not self.is_logged_in:
             return {"ok": False, "error": "not_logged_in"}
         try:
-            r = self.session.get(f"{API_BASE}/account/balance", timeout=10)
+            with self._lock:
+                r = self._session_ops.get(f"{API_BASE}/account/balance", timeout=10)
             if r.status_code == 200:
                 return {"ok": True, "data": r.json().get("data", {})}
             return {"ok": False, "error": f"http_{r.status_code}", "body": r.text[:300]}
         except Exception as e:
             return {"ok": False, "error": "network_error", "message": str(e)}
 
+    def get_trueno_transactions(self) -> dict:
+        """Trae transacciones del accountType=Trueno · usado por server.py _trueno_sync.
+        2026-05-23 · NUEVO método para encapsular · server.py NO debe acceder _session_ops direct."""
+        if not self.is_logged_in:
+            return {"ok": False, "error": "not_logged_in"}
+        try:
+            with self._lock:
+                r = self._session_ops.get(
+                    f"{API_BASE}/account/transactions",
+                    params={"accountType": "Trueno"},
+                    timeout=15,
+                )
+            if r.status_code != 200:
+                return {"ok": False, "status": r.status_code, "body": r.text[:300]}
+            return {"ok": True, "data": r.json().get("data", {})}
+        except Exception as e:
+            return {"ok": False, "error": "network_error", "message": str(e)}
+
     def get_bank_codes(self) -> dict:
         try:
-            r = self.session.get(f"{API_BASE}/account/bank-codes", timeout=10)
+            with self._lock:
+                r = self._session_ops.get(f"{API_BASE}/account/bank-codes", timeout=10)
             return {"ok": r.status_code == 200, "data": r.json().get("data") if r.status_code == 200 else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def get_transactions(self) -> dict:
         try:
-            r = self.session.get(f"{API_BASE}/account/transactions", timeout=10)
+            with self._lock:
+                r = self._session_ops.get(f"{API_BASE}/account/transactions", timeout=10)
             return {"ok": r.status_code == 200, "data": r.json().get("data") if r.status_code == 200 else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -635,12 +733,13 @@ class RelampagoSession:
             }
         }
         try:
-            r = self.session.post(
-                f"{API_BASE}/transactions/resolve-payee",
-                json=body,
-                headers={"Content-Type": "application/json"},
-                timeout=15,
-            )
+            with self._lock:
+                r = self._session_ops.post(
+                    f"{API_BASE}/transactions/resolve-payee",
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=15,
+                )
             return {
                 "ok": r.status_code == 200,
                 "status": r.status_code,
@@ -656,12 +755,13 @@ class RelampagoSession:
         """
         body = {"data": {"transfers": transfers}}
         try:
-            r = self.session.post(
-                f"{API_BASE}/transactions/execute",
-                json=body,
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            )
+            with self._lock:
+                r = self._session_ops.post(
+                    f"{API_BASE}/transactions/execute",
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=30,
+                )
             return {
                 "ok": 200 <= r.status_code < 300,  # FIX · 201 también OK (Created)
                 "status": r.status_code,

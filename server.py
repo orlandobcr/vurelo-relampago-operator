@@ -852,18 +852,16 @@ _trueno_stop = threading.Event()
 
 
 def _do_trueno_sync():
-    """Trae /account/transactions?accountType=Trueno y persiste en DB. Detecta rejected."""
-    if not relampago.is_logged_in:
-        return {"ok": False, "error": "not_logged_in"}
+    """Trae /account/transactions?accountType=Trueno y persiste en DB. Detecta rejected.
+    2026-05-23 · refactor · usa relampago.get_trueno_transactions() · NO acceso direct a session."""
+    result = relampago.get_trueno_transactions()
+    if not result.get("ok"):
+        if result.get("error") == "not_logged_in":
+            return result
+        log_event("trueno_sync_error", {"error": result.get("error") or f"http_{result.get('status')}"})
+        return result
     try:
-        r = relampago.session.get(
-            "https://api.relampago-pay.io/v0/account/transactions",
-            params={"accountType": "Trueno"},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return {"ok": False, "status": r.status_code, "body": r.text[:300]}
-        transfers = r.json().get("data", {}).get("transfers", [])
+        transfers = result["data"].get("transfers", [])
         for t in transfers:
             storage.upsert_trueno_transaction(t)
         # Cross-reference (detecta rejected_after_sent)

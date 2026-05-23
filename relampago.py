@@ -260,16 +260,21 @@ class RelampagoSession:
         """
         Monitor continuo del token · refresh JUSTO antes de que expire.
         Estrategia:
-          1. Sleep 30s · check time-to-expire
-          2. Si quedan <= REFRESH_LEAD_S (60s) · intentar refresh
-          3. Si server dice "not ready" · esperar REFRESH_RETRY_S y reintentar
-          4. Si todavía no ready y quedan <30s · loop frenético cada 10s
-          5. Si expira o 401 · marcar logged_out · stop loop
+          1. PRIMER check INMEDIATO (sin esperar el intervalo · cubre post-startup)
+          2. Sleep 15s entre checks
+          3. Si quedan <= REFRESH_LEAD_S (60s) · intentar refresh
+          4. Si server dice "not ready" · esperar REFRESH_RETRY_S y reintentar
+          5. Si todavía no ready y quedan <30s · loop frenético cada 10s
+          6. Si expira o 401 · marcar logged_out · stop loop
         """
-        CHECK_INTERVAL = 30  # cada 30s revisa el time-to-expire
+        CHECK_INTERVAL = 15  # cada 15s · más resolución (era 30s)
+        first_iteration = True
         while not self._refresh_stop.is_set():
-            if self._refresh_stop.wait(CHECK_INTERVAL):
-                break
+            # Primer check sin esperar (cubre el caso post-startup que el token esté cerca expire)
+            if not first_iteration:
+                if self._refresh_stop.wait(CHECK_INTERVAL):
+                    break
+            first_iteration = False
             if not self._logged_in:
                 break
             if not self._token_expires_at:
@@ -410,6 +415,11 @@ class RelampagoSession:
         Hace un health-check rápido a /account/balance.
         Si 200 · sesión viva · marca logged_in y arranca refresh loop.
         Si 401/403 · sesión muerta · clear cookies.
+
+        IMPORTANTE: si el token tiene <= 2*LEAD seconds de vida (120s default),
+        forzamos un refresh INMEDIATO antes de retornar · esto evita el gap
+        post-redeploy donde el container arranca con token casi expirado y el
+        loop normal (que espera 30s entre checks) no alcanza a refrescar.
         """
         if "access_token" not in self.session.cookies:
             return False
@@ -417,9 +427,16 @@ class RelampagoSession:
             r = self.session.get(f"{API_BASE}/account/balance", timeout=8)
             if r.status_code == 200:
                 self._logged_in = True
-                # Si token_expires_at no estaba seteado · estimar (worst case)
                 if not self._token_expires_at:
                     self._token_expires_at = time.time() + self.TOKEN_LIFETIME_S
+
+                # Refresh INMEDIATO si quedan <= 2*LEAD (default 120s)
+                # Cubre el caso post-redeploy · token podría estar cerca del expire
+                remaining = self._token_expires_at - time.time()
+                if remaining <= (2 * self.REFRESH_LEAD_S):
+                    print(f"⚡ Token quedan {int(remaining)}s · forzando refresh inmediato post-startup")
+                    self._do_refresh()  # síncrono · no esperamos al loop
+
                 self._start_refresh_loop()
                 return True
             elif r.status_code in (401, 403):

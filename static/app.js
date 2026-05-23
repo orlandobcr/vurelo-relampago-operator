@@ -272,7 +272,7 @@ async function loadQueue() {
     items.forEach(it => {
       const p = document.querySelector(`[data-id="${it.id}"] .btn-process`);
       const rj = document.querySelector(`[data-id="${it.id}"] .btn-reject`);
-      if (p) p.addEventListener("click", () => processItem(it.id));
+      if (p && !p.disabled) p.addEventListener("click", () => processItem(it.id));
       if (rj) rj.addEventListener("click", () => rejectItem(it.id));
     });
   } catch (e) {}
@@ -286,19 +286,31 @@ function renderQueueItem(it) {
   else if (STATE.failed.has(it.id)) { cls = "failed"; lbl = "✗"; }
   const d = it.destination || {};
   const key = d.key_value || d.account_number || "—";
+
+  // Rule check · si bloqueado · botón disabled + razón
+  const rc = it.rule_check || { ok: true };
+  const blocked = !rc.ok;
+  const blockTxt = blocked
+    ? `<div class="qi-blocked">🚫 ${escapeHtml(rc.detail || rc.reason || "Bloqueado por regla")}</div>`
+    : "";
+  const processBtn = blocked
+    ? `<button class="btn-disabled btn-process" disabled title="${escapeHtml(rc.detail || '')}">⛔ ${rc.reason === 'min_gap' ? 'Espera gap' : 'Anti-duplicado'}</button>`
+    : `<button class="btn-success btn-process">▶ Procesar</button>`;
+
   return `
-    <div class="queue-item ${cls}" data-id="${escapeHtml(it.id)}">
+    <div class="queue-item ${cls} ${blocked ? 'rule-blocked' : ''}" data-id="${escapeHtml(it.id)}">
       <div class="qi-info">
         <div class="qi-name">${escapeHtml(d.fullname || "—")} ${lbl}</div>
         <div class="qi-meta">
           ${(it.rail || "").toUpperCase()} · ${escapeHtml(key)}
           · ${escapeHtml(d.doc_type || "CC")} ${escapeHtml(d.doc_number || "")}
         </div>
+        ${blockTxt}
       </div>
       <div class="qi-amount">$ ${fmt(it.amount_cop)}</div>
       ${cls ? "" : `
         <div class="qi-actions">
-          <button class="btn-success btn-process">▶ Procesar</button>
+          ${processBtn}
           <button class="btn-danger btn-reject">✗ Rechazar</button>
         </div>
       `}

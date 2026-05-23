@@ -380,22 +380,47 @@ def api_kashport_token():
     return jsonify({"ok": True, "configured": kashport.configured, "persisted": True})
 
 
+def _annotate_queue_with_rules(data: dict) -> dict:
+    """
+    Para cada item · agregar rule_check · {ok, reason?, detail?, wait_seconds?}.
+    UI usa esto para deshabilitar botón "▶ Procesar" si bloqueo activo.
+    """
+    if not data or not data.get("items"):
+        return data
+    for it in data["items"]:
+        d = it.get("destination") or {}
+        key = d.get("key_value") or d.get("account_number")
+        amount = it.get("amount_cop") or it.get("amount") or 0
+        if key and amount:
+            try:
+                check = storage.check_dispersion_rules(key, int(amount))
+                it["rule_check"] = check
+            except Exception as e:
+                it["rule_check"] = {"ok": True, "error": str(e)}
+    return data
+
+
 @app.route("/api/queue")
 def api_queue():
     """
     AUTO ON  · usa el cache del poller background (fresco · cada 30s).
     AUTO OFF · fetch sincrónico (solo cuando UI lo pide · no consume sin necesidad).
+    Cada item es anotado con rule_check (anti-duplicado + gap).
     """
     if AUTO_MODE["enabled"] and KASHPORT_CACHE["data"] is not None:
+        annotated = _annotate_queue_with_rules(KASHPORT_CACHE["data"] or {"items": [], "count": 0})
         return jsonify({
             "ok": KASHPORT_CACHE["ok"],
-            "data": KASHPORT_CACHE["data"] or {"items": [], "count": 0},
+            "data": annotated,
             "fetched_at": KASHPORT_CACHE["fetched_at"],
             "from_cache": True,
             "error": KASHPORT_CACHE.get("error"),
         })
     # AUTO OFF · fetch directo
-    return jsonify(kashport.pending())
+    resp = kashport.pending()
+    if resp.get("ok"):
+        resp["data"] = _annotate_queue_with_rules(resp["data"])
+    return jsonify(resp)
 
 
 @app.route("/api/process/<item_id>", methods=["POST"])

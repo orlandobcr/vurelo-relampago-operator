@@ -254,6 +254,23 @@ input:checked + .slider::before { transform: translateX(18px); }
 .qi-meta { font-size: 11px; color: #94a3b8; margin-top: 2px; }
 .qi-amount { font-size: 15px; font-weight: 700; color: #fbbf24; text-align: right; min-width: 110px; }
 .qi-actions { grid-column: 1 / -1; display: flex; gap: 6px; margin-top: 6px; }
+.queue-item.rule-blocked { border-left-color: #f59e0b; background: rgba(245, 158, 11, 0.05); }
+.qi-blocked {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.10);
+  padding: 4px 8px;
+  border-radius: 4px;
+  border-left: 2px solid #f59e0b;
+}
+.btn-disabled {
+  background: #374151;
+  color: #6b7280;
+  border-color: #4b5563;
+  cursor: not-allowed;
+}
+.btn-disabled:hover { background: #374151; }
 
 /* Stats bar */
 .stats-card { display: flex; gap: 30px; justify-content: space-around; }

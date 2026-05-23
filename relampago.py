@@ -309,6 +309,14 @@ class RelampagoSession:
         self._consecutive_errors = 0
         # Diagnostic 2026-05-23 · track Cognito refresh_token TTL (30d default)
         self._session_started_at = time.time()
+
+        # ROOT CAUSE FIX 2026-05-23 · prevent local cookie expiry
+        # session_id Max-Age=3600s · server NO renueva en refresh · cookie expira en jar.
+        # Setting expires=None prevents local expiry · server-side cookie still validated.
+        for cookie in list(self._session_auth.cookies):
+            if cookie.name in ("access_token", "session_id", "cognito", "post-auth"):
+                cookie.expires = None
+
         # Sync auth cookies to ops session (atomic post-login fresh)
         with self._lock:
             self._sync_cookies_to_ops()
@@ -466,7 +474,27 @@ class RelampagoSession:
                 self._refresh_count += 1
                 self._consecutive_errors = 0
 
-                # Diagnostic 2026-05-23 · detectar si cookies realmente rotaron
+                # ============ ROOT CAUSE FIX 2026-05-23 · session_id local expiry ============
+                # Server Relampago Pay · session_id cookie Max-Age=3600s · server NO renueva
+                # session_id en cada refresh (solo access_token rota). A los 60 min post-login
+                # fresh · session_id EXPIRA en local cookie jar (requests cleans expired cookies).
+                # Próximo refresh va SIN session_id · server 500 → 500 → 403 · SESIÓN PERDIDA.
+                #
+                # Pattern observado · TIMING ANALYSIS log:
+                #   18:54:51 LOGIN · session_id rotated=TRUE
+                #   19:04:43 refresh · rotated=FALSE (server keeps same)
+                #   ... (todos rotated=FALSE)
+                #   19:53:58 fail HTTP 500 (53s pre-3600s expire teórico)
+                #   19:54:08 REVOKED 403 · session perdida
+                #
+                # FIX · forzar `expires=None` en cookies post-refresh OK.
+                # `requests.Session` cookie jar limpia cookies expired locally.
+                # Setting expires=None hace que cookie NUNCA expire en local jar.
+                # Server-side · sigue válido (session_id is opaque para server).
+                for cookie in list(self._session_auth.cookies):
+                    if cookie.name in ("access_token", "session_id", "cognito", "post-auth"):
+                        cookie.expires = None  # never expire locally · keep alive
+
                 # Sync cookies from auth → ops atomic (POST refresh OK)
                 self._sync_cookies_to_ops()
                 new_access = self._session_auth.cookies.get("access_token")
@@ -579,6 +607,13 @@ class RelampagoSession:
                     domain=info.get("domain"),
                     path=info.get("path", "/"),
                 )
+
+            # ROOT CAUSE FIX 2026-05-23 · prevent local cookie expiry post-restore
+            # SQLite restore puede traer cookies con expires viejos · forzar expires=None
+            for cookie in list(self._session_auth.cookies):
+                if cookie.name in ("access_token", "session_id", "cognito", "post-auth"):
+                    cookie.expires = None
+
             # Sync cookies a _session_ops (atómico bajo lock)
             with self._lock:
                 self._sync_cookies_to_ops()

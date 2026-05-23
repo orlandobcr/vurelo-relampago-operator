@@ -222,7 +222,16 @@ def api_login_mfa():
     result = relampago.login_mfa(pin)
     log_event("login_mfa", {"ok": result.get("ok"), "message": result.get("message")})
     if result.get("ok"):
+        # Audit fix 2026-05-23 · si auto_mode está enabled · arrancar loops automático
+        # post-login. Pre-fix · solo _start_trueno_sync · auto_loop NO arrancaba post-MFA
+        # y user tenía que toggle manual auto OFF→ON para activar. Bug observado tras
+        # container restart + re-login.
         _start_trueno_sync()
+        if AUTO_MODE["enabled"]:
+            _start_auto_loop()
+            _start_kashport_poller()
+            log_event("auto_loops_started_post_login", {"trigger": "login_mfa"})
+            print("▶ AUTO loop + Kashport poller arrancados post-MFA (auto_mode=ON)")
     return jsonify(result)
 
 

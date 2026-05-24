@@ -584,8 +584,32 @@ def api_process(item_id):
     log_event("execute_attempt", {"item_id": item_id, "resp_status": execute.get("status")})
 
     if not execute.get("ok"):
-        # NO mark-paid · pero submit ya pasó · NO retry
+        # 2026-05-23 audit GAP fix · NO mark-paid · submit falló · attention_items critical.
+        # Item queda en processed_ids in-memory (anti-retry esta sesión) · operador manual review.
         log_event("execute_failed", {"item_id": item_id, "detail": execute})
+        try:
+            storage.add_attention(
+                kind="execute_failed",
+                severity="critical",
+                relampago_tx_id=None,
+                external_id=None,
+                kashport_provider_id=item.get("oldvprovider_id"),
+                payee_name=(item.get("destination") or {}).get("fullname") or "(sin nombre)",
+                amount_cop=int(amount_cop_pesos),
+                description=(
+                    f"Relampago execute FALLÓ · ${int(amount_cop_pesos):,.0f} → {key} · "
+                    f"status={execute.get('status')} · revisar Trueno manualmente"
+                ),
+                detail_json={
+                    "kashport_id": item_id,
+                    "key_tried": key,
+                    "amount_cop": int(amount_cop_pesos),
+                    "rail": routing,
+                    "execute_response": execute,
+                },
+            )
+        except Exception as e:
+            log_event("attention_persist_error", {"error": str(e), "context": "execute_failed"})
         return jsonify({
             "ok": False,
             "error": "execute_failed",
@@ -663,6 +687,7 @@ def api_reject(item_id):
     """
     Manual reject desde UI · POST sin body a Kashport (igual extension v0.3).
     Si llega un body con reason · pasarlo (caso edge donde se especifica razón).
+    2026-05-23 audit GAP fix · attention_items severity=info para audit trail completo.
     """
     body = request.get_json(force=True, silent=True) or {}
     reason = body.get("reason", "")  # vacío default · igual a extension
@@ -670,7 +695,33 @@ def api_reject(item_id):
     result = kashport.mark_rejected(item_id, reason=reason, detail=detail)
     if result.get("ok"):
         COMPLETED_IDS.add(item_id)
-    log_event("manual_reject", {"item_id": item_id, "result": result})
+    log_event("manual_reject", {
+        "item_id": item_id,
+        "reason": reason,
+        "detail": detail,
+        "result": result,
+    })
+    # 2026-05-23 audit · attention_items para tracking todos los rejects
+    try:
+        storage.add_attention(
+            kind="manual_reject",
+            severity="info",
+            relampago_tx_id=None,
+            external_id=None,
+            kashport_provider_id=None,
+            payee_name=None,
+            amount_cop=None,
+            description=f"Manual reject Kashport · item={item_id} · reason={reason or 'sin reason'}",
+            detail_json={
+                "kashport_id": item_id,
+                "reason": reason,
+                "detail": detail,
+                "kashport_response": result,
+                "kashport_ok": result.get("ok"),
+            },
+        )
+    except Exception as e:
+        log_event("attention_persist_error", {"error": str(e), "context": "manual_reject"})
     return jsonify(result)
 
 
@@ -967,6 +1018,29 @@ def _finalize_pending_kashport_marks() -> dict:
                         "relampago_tx_id": vtrx_id,
                         "paid": paid,
                     })
+                    # 2026-05-23 audit · Kashport API failure · operador manual
+                    try:
+                        storage.add_attention(
+                            kind="kashport_mark_paid_failed",
+                            severity="critical",
+                            relampago_tx_id=vtrx_id,
+                            external_id=record.get("external_id"),
+                            kashport_provider_id=record.get("kashport_provider_id"),
+                            payee_name=record.get("payee_name"),
+                            amount_cop=record.get("amount_cop"),
+                            description=(
+                                f"Kashport mark_paid FALLÓ · Relampago sent OK · "
+                                f"${record.get('amount_cop'):,.0f} · revisar Kashport manualmente"
+                            ),
+                            detail_json={
+                                "kashport_id": kashport_id,
+                                "vtrx_id": vtrx_id,
+                                "kashport_response": paid,
+                                "relampago_state": state,
+                            },
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 out["errors"].append({"vtrx": vtrx_id, "error": f"mark_paid_exception: {e}"})
 
@@ -1017,6 +1091,35 @@ def _finalize_pending_kashport_marks() -> dict:
                         "action": "mark_rejected_failed",
                         "kashport_response": rej,
                     })
+                    log_event("kashport_mark_rejected_failed", {
+                        "kashport_id": kashport_id,
+                        "relampago_tx_id": vtrx_id,
+                        "rej": rej,
+                    })
+                    # 2026-05-23 audit · Kashport mark_rejected API falló · critical
+                    try:
+                        storage.add_attention(
+                            kind="kashport_mark_rejected_failed",
+                            severity="critical",
+                            relampago_tx_id=vtrx_id,
+                            external_id=record.get("external_id"),
+                            kashport_provider_id=record.get("kashport_provider_id"),
+                            payee_name=record.get("payee_name"),
+                            amount_cop=record.get("amount_cop"),
+                            description=(
+                                f"Kashport mark_rejected FALLÓ · Relampago rechazó dispersión · "
+                                f"${record.get('amount_cop'):,.0f} · Kashport NO marcado · revisar manualmente"
+                            ),
+                            detail_json={
+                                "kashport_id": kashport_id,
+                                "vtrx_id": vtrx_id,
+                                "kashport_response": rej,
+                                "relampago_state": state,
+                                "declination": declination,
+                            },
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 out["errors"].append({"vtrx": vtrx_id, "error": f"mark_rejected_exception: {e}"})
 

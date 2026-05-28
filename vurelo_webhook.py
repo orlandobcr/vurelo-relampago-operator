@@ -50,6 +50,7 @@ def notify_finalize(
     state: str,
     relampago_tx_id: str,
     kashport_item_id: Optional[str] = None,
+    kashport_provider_id: Optional[str] = None,
     amount_cop: Optional[int] = None,
     reason: Optional[str] = None,
     detail: Optional[str] = None,
@@ -82,6 +83,10 @@ def notify_finalize(
         "external_id": external_id,
         "relampago_tx_id": relampago_tx_id or "",
         "kashport_item_id": kashport_item_id,
+        # 2026-05-28 · Cobre payment_id (mm_xxx) · backend HAv1 lookup via
+        # metadata.provider_response.id porque external_id viene como KAMIN tx
+        # (no existe en backend) mientras mm_xxx sí.
+        "kashport_provider_id": kashport_provider_id,
         "amount_cop": amount_cop,
         "state": state,
         "reason": reason,

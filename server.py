@@ -994,10 +994,11 @@ def _finalize_pending_kashport_marks() -> dict:
             # Ahora: solo vurelo_webhook.notify_finalize (single source of truth).
             try:
                 wh = vurelo_webhook.notify_finalize(
-                    external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
+                    external_id=str(record.get("external_id") or ""),
                     state="approved",
                     relampago_tx_id=vtrx_id,
                     kashport_item_id=str(kashport_id),
+                    kashport_provider_id=record.get("kashport_provider_id"),
                     amount_cop=int(record.get("amount_cop") or 0),
                 )
                 if wh.get("ok"):
@@ -1056,10 +1057,11 @@ def _finalize_pending_kashport_marks() -> dict:
                 # 2026-05-29 · BYPASS Kashport · solo notify Vurelo webhook
                 try:
                     wh = vurelo_webhook.notify_finalize(
-                        external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
+                        external_id=str(record.get("external_id") or ""),
                         state="rejected",
                         relampago_tx_id=vtrx_id,
                         kashport_item_id=str(kashport_id),
+                        kashport_provider_id=record.get("kashport_provider_id"),
                         amount_cop=int(record.get("amount_cop") or 0),
                         reason=reason,
                         detail=detail,

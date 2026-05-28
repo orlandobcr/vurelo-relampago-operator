@@ -28,6 +28,7 @@ import storage
 import notifier
 import google_oauth
 import auth as gauth
+import vurelo_webhook  # 2026-05-29 · cierre saga BREB_CASHOUT api.vurelo.co
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -1007,6 +1008,51 @@ def _finalize_pending_kashport_marks() -> dict:
                             "state": state,
                             "amount_cop": record.get("amount_cop"),
                         })
+                    # 2026-05-29 · ADEMÁS notify webhook Vurelo backend HAv1
+                    # para cierre saga BREB_CASHOUT · bypass Kashport como "answer"
+                    try:
+                        wh = vurelo_webhook.notify_finalize(
+                            external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
+                            state="approved",
+                            relampago_tx_id=vtrx_id,
+                            kashport_item_id=str(kashport_id),
+                            amount_cop=int(record.get("amount_cop") or 0),
+                        )
+                        log_event("vurelo_webhook_paid", {
+                            "kashport_id": kashport_id,
+                            "vtrx_id": vtrx_id,
+                            "ok": wh.get("ok"),
+                            "status": wh.get("status"),
+                            "body": wh.get("body", "")[:200],
+                            "error": wh.get("error"),
+                        })
+                        if not wh.get("ok"):
+                            # Webhook fail · escalar attention_items (no bloquear flow)
+                            try:
+                                storage.add_attention(
+                                    kind="vurelo_webhook_paid_failed",
+                                    severity="warn",
+                                    relampago_tx_id=vtrx_id,
+                                    external_id=record.get("external_id"),
+                                    kashport_provider_id=record.get("kashport_provider_id"),
+                                    payee_name=record.get("payee_name"),
+                                    amount_cop=record.get("amount_cop"),
+                                    description=(
+                                        f"Vurelo webhook paid FALLÓ · Kashport OK pero "
+                                        f"saga BREB_CASHOUT HAv1 NO cerrado · revisar"
+                                    ),
+                                    detail_json={
+                                        "kashport_id": kashport_id,
+                                        "vtrx_id": vtrx_id,
+                                        "webhook_response": wh,
+                                    },
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log_event("vurelo_webhook_paid_exception", {
+                            "kashport_id": kashport_id, "vtrx_id": vtrx_id, "error": str(e),
+                        })
                 else:
                     out["errors"].append({
                         "vtrx": vtrx_id,
@@ -1059,6 +1105,51 @@ def _finalize_pending_kashport_marks() -> dict:
                             "state": state,
                             "declination": declination,
                             "amount_cop": record.get("amount_cop"),
+                        })
+                    # 2026-05-29 · webhook Vurelo backend HAv1 · release hold + REJECTED
+                    try:
+                        wh = vurelo_webhook.notify_finalize(
+                            external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
+                            state="rejected",
+                            relampago_tx_id=vtrx_id,
+                            kashport_item_id=str(kashport_id),
+                            amount_cop=int(record.get("amount_cop") or 0),
+                            reason=reason,
+                            detail=detail,
+                        )
+                        log_event("vurelo_webhook_rejected", {
+                            "kashport_id": kashport_id,
+                            "vtrx_id": vtrx_id,
+                            "ok": wh.get("ok"),
+                            "status": wh.get("status"),
+                            "body": wh.get("body", "")[:200],
+                            "error": wh.get("error"),
+                        })
+                        if not wh.get("ok"):
+                            try:
+                                storage.add_attention(
+                                    kind="vurelo_webhook_rejected_failed",
+                                    severity="warn",
+                                    relampago_tx_id=vtrx_id,
+                                    external_id=record.get("external_id"),
+                                    kashport_provider_id=record.get("kashport_provider_id"),
+                                    payee_name=record.get("payee_name"),
+                                    amount_cop=record.get("amount_cop"),
+                                    description=(
+                                        f"Vurelo webhook rejected FALLÓ · Kashport rejected OK "
+                                        f"pero saga HAv1 sin cerrar · revisar release hold"
+                                    ),
+                                    detail_json={
+                                        "kashport_id": kashport_id,
+                                        "vtrx_id": vtrx_id,
+                                        "webhook_response": wh,
+                                    },
+                                )
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        log_event("vurelo_webhook_rejected_exception", {
+                            "kashport_id": kashport_id, "vtrx_id": vtrx_id, "error": str(e),
                         })
 
                         # Attention item para audit · severity warn (operator review)

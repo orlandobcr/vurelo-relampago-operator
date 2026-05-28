@@ -1047,42 +1047,6 @@ def _finalize_pending_kashport_marks() -> dict:
                         pass
             except Exception as e:
                 out["errors"].append({"vtrx": vtrx_id, "error": f"vurelo_webhook_paid_exception: {e}"})
-                else:
-                    out["errors"].append({
-                        "vtrx": vtrx_id,
-                        "action": "mark_paid_failed",
-                        "kashport_response": paid,
-                    })
-                    log_event("kashport_mark_paid_failed", {
-                        "kashport_id": kashport_id,
-                        "relampago_tx_id": vtrx_id,
-                        "paid": paid,
-                    })
-                    # 2026-05-23 audit · Kashport API failure · operador manual
-                    try:
-                        storage.add_attention(
-                            kind="kashport_mark_paid_failed",
-                            severity="critical",
-                            relampago_tx_id=vtrx_id,
-                            external_id=record.get("external_id"),
-                            kashport_provider_id=record.get("kashport_provider_id"),
-                            payee_name=record.get("payee_name"),
-                            amount_cop=record.get("amount_cop"),
-                            description=(
-                                f"Kashport mark_paid FALLÓ · Relampago sent OK · "
-                                f"${record.get('amount_cop'):,.0f} · revisar Kashport manualmente"
-                            ),
-                            detail_json={
-                                "kashport_id": kashport_id,
-                                "vtrx_id": vtrx_id,
-                                "kashport_response": paid,
-                                "relampago_state": state,
-                            },
-                        )
-                    except Exception:
-                        pass
-            except Exception as e:
-                out["errors"].append({"vtrx": vtrx_id, "error": f"mark_paid_exception: {e}"})
 
         elif state in RELAMPAGO_STATES_FINAL_FAIL:
             # FINAL FAIL · mark Kashport rejected con motivo real Relampago
@@ -1148,67 +1112,32 @@ def _finalize_pending_kashport_marks() -> dict:
                 except Exception as e:
                     out["errors"].append({"vtrx": vtrx_id, "error": f"vurelo_webhook_rejected_exception: {e}"})
 
-                        # Attention item para audit · severity warn (operator review)
-                        try:
-                            storage.add_attention(
-                                kind="rejected_by_relampago_async",
-                                severity="warn",
-                                relampago_tx_id=vtrx_id,
-                                external_id=record.get("external_id"),
-                                kashport_provider_id=record.get("kashport_provider_id"),
-                                payee_name=record.get("payee_name"),
-                                amount_cop=record.get("amount_cop"),
-                                description=(
-                                    f"Relampago rechazó dispersión · ${record.get('amount_cop'):,.0f} "
-                                    f"· state={state} · {declination or 'sin detalle'}"
-                                ),
-                                detail_json={
-                                    "vtrx_id": vtrx_id,
-                                    "kashport_id": kashport_id,
-                                    "state": state,
-                                    "declination": declination,
-                                    "trueno_match": trueno_match,
-                                },
-                            )
-                        except Exception:
-                            pass
-                else:
-                    out["errors"].append({
-                        "vtrx": vtrx_id,
-                        "action": "mark_rejected_failed",
-                        "kashport_response": rej,
-                    })
-                    log_event("kashport_mark_rejected_failed", {
-                        "kashport_id": kashport_id,
-                        "relampago_tx_id": vtrx_id,
-                        "rej": rej,
-                    })
-                    # 2026-05-23 audit · Kashport mark_rejected API falló · critical
-                    try:
-                        storage.add_attention(
-                            kind="kashport_mark_rejected_failed",
-                            severity="critical",
-                            relampago_tx_id=vtrx_id,
-                            external_id=record.get("external_id"),
-                            kashport_provider_id=record.get("kashport_provider_id"),
-                            payee_name=record.get("payee_name"),
-                            amount_cop=record.get("amount_cop"),
-                            description=(
-                                f"Kashport mark_rejected FALLÓ · Relampago rechazó dispersión · "
-                                f"${record.get('amount_cop'):,.0f} · Kashport NO marcado · revisar manualmente"
-                            ),
-                            detail_json={
-                                "kashport_id": kashport_id,
-                                "vtrx_id": vtrx_id,
-                                "kashport_response": rej,
-                                "relampago_state": state,
-                                "declination": declination,
-                            },
-                        )
-                    except Exception:
-                        pass
+                # Attention item para audit · severity warn (operator review)
+                try:
+                    storage.add_attention(
+                        kind="rejected_by_relampago_async",
+                        severity="warn",
+                        relampago_tx_id=vtrx_id,
+                        external_id=record.get("external_id"),
+                        kashport_provider_id=record.get("kashport_provider_id"),
+                        payee_name=record.get("payee_name"),
+                        amount_cop=record.get("amount_cop"),
+                        description=(
+                            f"Relampago rechazó dispersión · ${record.get('amount_cop'):,.0f} "
+                            f"· state={state} · {declination or 'sin detalle'}"
+                        ),
+                        detail_json={
+                            "vtrx_id": vtrx_id,
+                            "kashport_id": kashport_id,
+                            "state": state,
+                            "declination": declination,
+                            "trueno_match": trueno_match,
+                        },
+                    )
+                except Exception:
+                    pass
             except Exception as e:
-                out["errors"].append({"vtrx": vtrx_id, "error": f"mark_rejected_exception: {e}"})
+                out["errors"].append({"vtrx": vtrx_id, "error": f"finalize_rejected_exception: {e}"})
 
         else:
             # state intermedio (created · pending · etc) · still awaiting

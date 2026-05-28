@@ -29,6 +29,7 @@ import notifier
 import google_oauth
 import auth as gauth
 import vurelo_webhook  # 2026-05-29 · cierre saga BREB_CASHOUT api.vurelo.co
+import vurelo_queue    # 2026-05-29 · poll backend HAv1 BREB cashout queue (replaces kashport poll)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -52,6 +53,18 @@ COMPLETED_IDS = set()        # mark-paid OK
 FAILED_IDS = {}              # id → attempts
 EVENT_LOG = []               # últimos eventos · UI debug
 LOG_MAX = 200
+
+# 2026-05-29 · queue source · "vurelo" (default · nuevo · backend HAv1) o "kashport" (legacy)
+QUEUE_SOURCE = os.environ.get("QUEUE_SOURCE", "vurelo").lower()
+VURELO_CACHE = {
+    "ok": None,
+    "data": None,
+    "fetched_at": None,
+    "fetched_epoch": None,
+    "consecutive_errors": 0,
+    "error": None,
+    "last_item_count": 0,
+}
 
 
 def log_event(kind: str, payload: dict):
@@ -228,11 +241,15 @@ def api_login_mfa():
         # y user tenía que toggle manual auto OFF→ON para activar. Bug observado tras
         # container restart + re-login.
         _start_trueno_sync()
+        # Vurelo poller arranca siempre (independiente auto_mode)
+        if QUEUE_SOURCE == "vurelo" and vurelo_queue.is_configured():
+            _start_vurelo_poller()
         if AUTO_MODE["enabled"]:
             _start_auto_loop()
-            _start_kashport_poller()
-            log_event("auto_loops_started_post_login", {"trigger": "login_mfa"})
-            print("▶ AUTO loop + Kashport poller arrancados post-MFA (auto_mode=ON)")
+            if QUEUE_SOURCE == "kashport":
+                _start_kashport_poller()
+            log_event("auto_loops_started_post_login", {"trigger": "login_mfa", "queue": QUEUE_SOURCE})
+            print(f"▶ AUTO loop arrancado post-MFA (auto_mode=ON · queue={QUEUE_SOURCE})")
     return jsonify(result)
 
 
@@ -436,13 +453,87 @@ def _annotate_queue_with_rules(data: dict) -> dict:
     return data
 
 
+def _vurelo_item_to_ui_shape(v: dict) -> dict:
+    """
+    Adapter · Vurelo backend item shape → UI shape esperada (compat con kashport).
+    Mantiene los campos legacy para que la UI siga funcionando + agrega los
+    nuevos campos del flow Vurelo.
+    """
+    dest = v.get("destination") or {}
+    claim = v.get("claim") or {}
+    return {
+        # UI legacy fields (compat)
+        "id": v.get("tx_id", ""),
+        "amount_cop": v.get("amount_cop_pesos", 0),
+        "amount": v.get("amount_cop_pesos", 0),
+        "rail": "breb",
+        "oldvprovider_id": v.get("external_id"),  # = "fast_pay:trx_xxx"
+        "destination": {
+            "key_value": dest.get("breb_key"),
+            "key_type": dest.get("breb_key_type"),
+            "fullname": v.get("description"),
+        },
+        # New Vurelo fields
+        "tx_id": v.get("tx_id"),
+        "external_id": v.get("external_id"),
+        "source_currency": v.get("source_currency"),
+        "source_value": v.get("source_value"),
+        "user_uuid": v.get("user_uuid"),
+        "claim": claim,
+        "cobre_payment_id": v.get("cobre_payment_id"),
+        "cobre_status": v.get("cobre_status"),
+        "source": "vurelo",
+        "_raw": v,
+    }
+
+
 @app.route("/api/queue")
 def api_queue():
     """
-    AUTO ON  · usa el cache del poller background (fresco · cada 30s).
-    AUTO OFF · fetch sincrónico (solo cuando UI lo pide · no consume sin necesidad).
+    Queue source · controlado por env QUEUE_SOURCE (default 'vurelo').
+
+    QUEUE_SOURCE = 'vurelo' · usa VURELO_CACHE del poller background o fetch
+                              directo si AUTO OFF · single source of truth.
+    QUEUE_SOURCE = 'kashport' · legacy · usa KASHPORT_CACHE / kashport.pending()
+
     Cada item es anotado con rule_check (anti-duplicado + gap).
     """
+    if QUEUE_SOURCE == "vurelo":
+        # Use VURELO_CACHE si hay data fresca · sino fetch directo
+        if VURELO_CACHE["data"] is not None and AUTO_MODE.get("enabled", False):
+            items_raw = (VURELO_CACHE["data"] or {}).get("items", [])
+            ui_items = [_vurelo_item_to_ui_shape(v) for v in items_raw]
+            data = {"items": ui_items, "count": len(ui_items)}
+            annotated = _annotate_queue_with_rules(data)
+            return jsonify({
+                "ok": True,
+                "data": annotated,
+                "fetched_at": VURELO_CACHE["fetched_at"],
+                "from_cache": True,
+                "source": "vurelo",
+                "error": VURELO_CACHE.get("error"),
+            })
+        # Direct fetch
+        r = vurelo_queue.pending(limit=100, include_claimed=False)
+        if not r.get("ok"):
+            return jsonify({
+                "ok": False,
+                "source": "vurelo",
+                "error": r.get("error") or r.get("body"),
+                "data": {"items": [], "count": 0},
+            })
+        ui_items = [_vurelo_item_to_ui_shape(v) for v in r.get("items", [])]
+        data = {"items": ui_items, "count": len(ui_items)}
+        annotated = _annotate_queue_with_rules(data)
+        return jsonify({
+            "ok": True,
+            "data": annotated,
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "from_cache": False,
+            "source": "vurelo",
+        })
+
+    # QUEUE_SOURCE = 'kashport' · legacy
     if AUTO_MODE["enabled"] and KASHPORT_CACHE["data"] is not None:
         annotated = _annotate_queue_with_rules(KASHPORT_CACHE["data"] or {"items": [], "count": 0})
         return jsonify({
@@ -450,6 +541,7 @@ def api_queue():
             "data": annotated,
             "fetched_at": KASHPORT_CACHE["fetched_at"],
             "from_cache": True,
+            "source": "kashport",
             "error": KASHPORT_CACHE.get("error"),
         })
     # AUTO OFF · fetch directo
@@ -683,6 +775,223 @@ def api_process(item_id):
     })
 
 
+@app.route("/api/process-vurelo/<tx_id>", methods=["POST"])
+def api_process_vurelo(tx_id):
+    """
+    Procesar UN item del flow Vurelo (backend HAv1 queue) · 2026-05-29.
+
+    Diferencia vs api_process (legacy kashport):
+    - Claim atómico via Vurelo backend (previene race entre instances)
+    - Lee item de VURELO_CACHE o fetch directo
+    - Dispatcha via Relámpago execute_dispersion (KAMIN) · igual al flow viejo
+    - record_sent_dispersion con vurelo_tx_id (= tx_id Vurelo trx_xxx)
+    - Cron _finalize_pending_kashport_marks luego notifica webhook
+      con external_id = tx_id (backend resuelve via findById)
+    """
+    # Hard guard · submit-once
+    if tx_id in PROCESSED_IDS or tx_id in COMPLETED_IDS:
+        return jsonify({
+            "ok": False,
+            "error": "already_processed",
+            "message": "Item ya fue procesado en esta sesión",
+        })
+
+    if not relampago.is_logged_in:
+        return jsonify({"ok": False, "error": "not_logged_in"})
+
+    # 1 · Find item · cache o fetch
+    items = (VURELO_CACHE.get("data") or {}).get("items", [])
+    item = next((v for v in items if v.get("tx_id") == tx_id), None)
+    if not item:
+        # Re-fetch para tener data fresca
+        r = vurelo_queue.pending(limit=200, include_claimed=False)
+        if not r.get("ok"):
+            return jsonify({"ok": False, "error": "queue_fetch_failed", "detail": r})
+        items = r.get("items", [])
+        item = next((v for v in items if v.get("tx_id") == tx_id), None)
+    if not item:
+        return jsonify({"ok": False, "error": "tx_not_in_queue"})
+
+    # 2 · Atomic claim (previene race · 2 instances no procesan misma tx)
+    claim_resp = vurelo_queue.claim(tx_id, claimed_by=vurelo_queue.RELAMPAGO_OPERATOR_ID)
+    if not claim_resp.get("ok") or not claim_resp.get("claimed"):
+        log_event("vurelo_claim_denied", {"tx_id": tx_id, "resp": claim_resp})
+        return jsonify({
+            "ok": False,
+            "error": claim_resp.get("error", "claim_failed"),
+            "already_claimed_by": claim_resp.get("already_claimed_by"),
+            "message": "Otra instancia Relámpago ya tomó esta tx · skip",
+        })
+
+    PROCESSED_IDS.add(tx_id)
+    log_event("vurelo_process_start", {"tx_id": tx_id})
+
+    # 3 · Extract dispatch data
+    dest = item.get("destination") or {}
+    key = dest.get("breb_key")
+    amount_cop_pesos = item.get("amount_cop_pesos") or 0
+    virtual_amount_cents = item.get("amount_cop_centavos") or int(round(float(amount_cop_pesos) * 100))
+    routing = "breb"
+
+    if not key or amount_cop_pesos <= 0:
+        # Release claim + error
+        vurelo_queue.release_claim(tx_id, reason="missing_key_or_amount")
+        PROCESSED_IDS.discard(tx_id)
+        return jsonify({"ok": False, "error": "invalid_item_data", "tx": item})
+
+    # 4 · Anti-duplicado / gap check
+    rules_check = storage.check_dispersion_rules(key, int(amount_cop_pesos))
+    if not rules_check.get("ok"):
+        vurelo_queue.release_claim(tx_id, reason=f"rule_blocked:{rules_check.get('reason')}")
+        PROCESSED_IDS.discard(tx_id)
+        log_event("vurelo_rule_blocked", {"tx_id": tx_id, "reason": rules_check.get("reason")})
+        return jsonify({
+            "ok": False,
+            "rule_blocked": True,
+            "reason": rules_check.get("reason"),
+            "message": rules_check.get("detail"),
+            "wait_seconds": rules_check.get("wait_seconds"),
+        })
+
+    # 5 · Validate llave · resolve_payee
+    resolve = relampago.resolve_payee(key, virtual_amount_cents, routing=routing)
+    if resolve.get("status") == 404:
+        # Llave inválida · notify webhook rejected · release no necesario (vamos a rejected definitivo)
+        try:
+            wh = vurelo_webhook.notify_finalize(
+                external_id=tx_id,                # backend strategy 0 · findById(trx_xxx)
+                state="rejected",
+                relampago_tx_id="",
+                kashport_item_id=None,
+                kashport_provider_id=item.get("cobre_payment_id"),
+                amount_cop=int(amount_cop_pesos),
+                reason="payee_key_invalid",
+                detail=f"Llave BREB no encontrada · validado vía Relampago API · key={key}",
+            )
+            log_event("vurelo_payee_invalid_notified", {"tx_id": tx_id, "wh": wh})
+        except Exception as e:
+            log_event("vurelo_notify_exception", {"tx_id": tx_id, "error": str(e)})
+        try:
+            storage.add_attention(
+                kind="vurelo_payee_invalid",
+                severity="warn",
+                relampago_tx_id=None,
+                external_id=tx_id,
+                kashport_provider_id=item.get("cobre_payment_id"),
+                payee_name=item.get("description"),
+                amount_cop=int(amount_cop_pesos),
+                description=f"Llave BREB inválida · {key} · monto ${int(amount_cop_pesos):,.0f} · tx {tx_id}",
+                detail_json={"tx_id": tx_id, "key_tried": key, "resolve": resolve.get("data")},
+            )
+        except Exception:
+            pass
+        COMPLETED_IDS.add(tx_id)
+        return jsonify({
+            "ok": False,
+            "auto_rejected": True,
+            "tx_id": tx_id,
+            "key": key,
+            "message": "Llave inválida · backend marca rejected + libera hold",
+        })
+    if not resolve.get("ok"):
+        vurelo_queue.release_claim(tx_id, reason=f"resolve_failed:{resolve.get('status')}")
+        FAILED_IDS[tx_id] = FAILED_IDS.get(tx_id, 0) + 1
+        PROCESSED_IDS.discard(tx_id)
+        return jsonify({"ok": False, "error": "resolve_failed", "detail": resolve})
+
+    # 6 · Execute dispersión
+    resolve_data = resolve.get("data", {}).get("data", {})
+    validated_transfers = resolve_data.get("transfers", [])
+    if not validated_transfers:
+        vurelo_queue.release_claim(tx_id, reason="no_validated_transfer")
+        PROCESSED_IDS.discard(tx_id)
+        return jsonify({"ok": False, "error": "no_validated_transfer"})
+
+    validated = validated_transfers[0]
+    # Description + reference · usar tx_id Vurelo (canonical) + external_id legacy
+    validated["description"] = item.get("external_id") or tx_id
+    validated["reference"] = item.get("external_id") or tx_id
+
+    execute = relampago.execute_dispersion([validated])
+    log_event("vurelo_execute_attempt", {"tx_id": tx_id, "resp_status": execute.get("status")})
+
+    if not execute.get("ok"):
+        # Release claim · operador o auto retry después
+        vurelo_queue.release_claim(tx_id, reason=f"execute_failed:status={execute.get('status')}")
+        try:
+            storage.add_attention(
+                kind="vurelo_execute_failed",
+                severity="critical",
+                relampago_tx_id=None,
+                external_id=tx_id,
+                kashport_provider_id=item.get("cobre_payment_id"),
+                payee_name=item.get("description"),
+                amount_cop=int(amount_cop_pesos),
+                description=(
+                    f"Relampago execute FALLÓ · ${int(amount_cop_pesos):,.0f} → {key} · "
+                    f"tx {tx_id} · status={execute.get('status')} · revisar Trueno manualmente"
+                ),
+                detail_json={"tx_id": tx_id, "key": key, "execute_response": execute},
+            )
+        except Exception:
+            pass
+        return jsonify({
+            "ok": False,
+            "error": "execute_failed",
+            "message": "Submit a Relampago falló · claim liberado · reintentable",
+            "detail": execute,
+        })
+
+    # 7 · Persist sent_dispersion · usa tx_id como kashport_id (semantic reuse · new flow)
+    txn = execute.get("data", {}).get("data", {}).get("transaction", {})
+    relampago_tx_id = txn.get("id")
+    kamin_external_id = txn.get("externalId")
+    state = txn.get("state", "unknown")
+    payee = txn.get("payee", {})
+    ba = payee.get("bankAccount", {})
+    try:
+        storage.record_sent_dispersion(
+            kashport_id=tx_id,                                 # NUEVO FLOW · = Vurelo tx_id
+            kashport_provider_id=item.get("cobre_payment_id"), # legacy compat (mm_xxx si existe)
+            relampago_tx_id=relampago_tx_id,
+            external_id=kamin_external_id,                     # KAMIN tx id (audit)
+            payee_name=payee.get("name"),
+            payee_key=ba.get("key") or ba.get("number"),
+            payee_doc=payee.get("documentNumber"),
+            payee_bank=ba.get("bankName"),
+            amount_cop=int(amount_cop_pesos),
+            rail=routing,
+            initial_state=state,
+            request_body={"transfers": [validated]},
+            response_body=execute.get("data"),
+            vurelo_tx_id=tx_id,                                # NUEVO column · explicit Vurelo tx_id
+        )
+    except Exception as e:
+        log_event("vurelo_storage_error", {"error": str(e)})
+
+    log_event("vurelo_execute_pending_final", {
+        "tx_id": tx_id,
+        "relampago_tx_id": relampago_tx_id,
+        "external_id": kamin_external_id,
+        "initial_state": state,
+        "amount_cop": int(amount_cop_pesos),
+    })
+
+    COMPLETED_IDS.add(tx_id)
+    return jsonify({
+        "ok": True,
+        "phase": "awaiting_relampago_final",
+        "tx_id": tx_id,
+        "relampago_tx_id": relampago_tx_id,
+        "external_id": kamin_external_id,
+        "state": state,
+        "message": (
+            f"Dispersión enviada · ${amount_cop_pesos:,.0f} → {key} · "
+            f"esperando estado final Relampago (vtrx={relampago_tx_id})"
+        ),
+    })
+
+
 @app.route("/api/reject/<item_id>", methods=["POST"])
 def api_reject(item_id):
     """
@@ -774,10 +1083,16 @@ def api_auto_toggle():
     log_event("auto_mode_changed", {"enabled": enabled, "persisted": True})
     if enabled:
         _start_auto_loop()
-        _start_kashport_poller()
+        # Vurelo poller arranca siempre (independiente · UI lo necesita)
+        if QUEUE_SOURCE == "vurelo" and vurelo_queue.is_configured():
+            _start_vurelo_poller()
+        elif QUEUE_SOURCE == "kashport":
+            _start_kashport_poller()
     else:
         _auto_stop.set()
-        _kashport_stop.set()
+        # Solo paramos auto loop · vurelo poller sigue alimentando UI
+        if QUEUE_SOURCE == "kashport":
+            _kashport_stop.set()
     return jsonify({"ok": True, "enabled": enabled, "persisted": True})
 
 
@@ -816,6 +1131,72 @@ def _start_kashport_poller():
     _kashport_thread = threading.Thread(target=_kashport_poller_loop, daemon=True, name="kashport-poller")
     _kashport_thread.start()
     log_event("kashport_poller_started", {"interval_s": KASHPORT_POLL_INTERVAL})
+
+
+# ============ Vurelo backend queue poller · 2026-05-29 · NEW ============
+
+_vurelo_thread = None
+_vurelo_stop = threading.Event()
+VURELO_POLL_INTERVAL = int(os.environ.get("VURELO_POLL_INTERVAL", "30"))
+
+
+def _start_vurelo_poller():
+    global _vurelo_thread
+    if _vurelo_thread and _vurelo_thread.is_alive():
+        return
+    _vurelo_stop.clear()
+    _vurelo_thread = threading.Thread(target=_vurelo_poller_loop, daemon=True, name="vurelo-poller")
+    _vurelo_thread.start()
+    log_event("vurelo_poller_started", {"interval_s": VURELO_POLL_INTERVAL})
+
+
+def _vurelo_poller_loop():
+    """
+    Poller Vurelo backend BREB cashout queue · ACTIVO SIEMPRE (no requiere
+    Relampago session activa). UI lee de VURELO_CACHE.
+    Auto loop usa cache para procesar items.
+    Si vurelo_queue no configurado · skip silencioso (log error N veces).
+    """
+    while not _vurelo_stop.is_set():
+        if not vurelo_queue.is_configured():
+            VURELO_CACHE["error"] = "not_configured · faltan VURELO_API_BASE_URL o VURELO_SERVICE_API_KEY"
+            VURELO_CACHE["consecutive_errors"] += 1
+            if VURELO_CACHE["consecutive_errors"] in (1, 10, 60):
+                log_event("vurelo_queue_not_configured", {
+                    "count": VURELO_CACHE["consecutive_errors"],
+                })
+        else:
+            try:
+                r = vurelo_queue.pending(limit=100, include_claimed=False)
+                if r.get("ok"):
+                    new_count = r.get("total", 0)
+                    prev_count = VURELO_CACHE.get("last_item_count", 0)
+                    VURELO_CACHE.update({
+                        "ok": True,
+                        "data": {"items": r.get("items", []), "count": new_count},
+                        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                        "fetched_epoch": time.time(),
+                        "consecutive_errors": 0,
+                        "error": None,
+                        "last_item_count": new_count,
+                    })
+                    if new_count != prev_count:
+                        log_event("vurelo_queue_changed", {
+                            "prev": prev_count, "now": new_count, "delta": new_count - prev_count,
+                        })
+                else:
+                    VURELO_CACHE["consecutive_errors"] += 1
+                    VURELO_CACHE["error"] = r.get("error") or r.get("body")
+                    if VURELO_CACHE["consecutive_errors"] in (3, 10, 30):
+                        log_event("vurelo_poll_errors", {
+                            "count": VURELO_CACHE["consecutive_errors"],
+                            "error": VURELO_CACHE["error"],
+                        })
+            except Exception as e:
+                VURELO_CACHE["consecutive_errors"] += 1
+                VURELO_CACHE["error"] = str(e)
+        if _vurelo_stop.wait(VURELO_POLL_INTERVAL):
+            break
 
 
 def _kashport_poller_loop():
@@ -875,32 +1256,57 @@ def _start_auto_loop():
 
 
 def _auto_loop():
-    """Loop que procesa items pending automáticamente. Configurable."""
+    """
+    Loop que procesa items pending automáticamente.
+    QUEUE_SOURCE = 'vurelo' (default) · usa VURELO_CACHE + api_process_vurelo.
+    QUEUE_SOURCE = 'kashport'         · legacy · usa kashport.pending + api_process.
+    """
     POLL_INTERVAL = 15  # segundos
     while not _auto_stop.is_set():
         if not AUTO_MODE["enabled"]:
             break
-        if not relampago.is_logged_in or not kashport.configured:
+        if not relampago.is_logged_in:
             time.sleep(5)
             continue
 
         try:
-            q = kashport.pending()
-            if q.get("ok"):
-                items = q["data"].get("items", [])
+            if QUEUE_SOURCE == "vurelo":
+                # Use VURELO_CACHE fresh o fetch directo
+                items = (VURELO_CACHE.get("data") or {}).get("items") or []
+                if not items:
+                    r = vurelo_queue.pending(limit=100, include_claimed=False)
+                    if r.get("ok"):
+                        items = r.get("items", [])
                 for it in items:
                     if not AUTO_MODE["enabled"]:
                         break
-                    iid = it.get("id")
-                    if not iid or iid in PROCESSED_IDS or iid in COMPLETED_IDS:
+                    tx_id = it.get("tx_id")
+                    if not tx_id or tx_id in PROCESSED_IDS or tx_id in COMPLETED_IDS:
                         continue
-                    if FAILED_IDS.get(iid, 0) >= 1:
-                        continue  # MAX_RETRIES = 1 (igual que la extension)
-                    log_event("auto_processing", {"item_id": iid})
-                    # Re-uso la lógica del endpoint
+                    if FAILED_IDS.get(tx_id, 0) >= 1:
+                        continue
+                    log_event("auto_processing_vurelo", {"tx_id": tx_id})
                     with app.test_request_context():
-                        # Llamar api_process directo
-                        api_process(iid)
+                        api_process_vurelo(tx_id)
+            else:
+                # Legacy Kashport
+                if not kashport.configured:
+                    time.sleep(5)
+                    continue
+                q = kashport.pending()
+                if q.get("ok"):
+                    items = q["data"].get("items", [])
+                    for it in items:
+                        if not AUTO_MODE["enabled"]:
+                            break
+                        iid = it.get("id")
+                        if not iid or iid in PROCESSED_IDS or iid in COMPLETED_IDS:
+                            continue
+                        if FAILED_IDS.get(iid, 0) >= 1:
+                            continue
+                        log_event("auto_processing", {"item_id": iid})
+                        with app.test_request_context():
+                            api_process(iid)
         except Exception as e:
             log_event("auto_error", {"error": str(e)})
 
@@ -990,11 +1396,13 @@ def _finalize_pending_kashport_marks() -> dict:
 
         if state in RELAMPAGO_STATES_FINAL_OK:
             # 2026-05-29 · BYPASS Kashport answer · solo notify Vurelo webhook.
-            # Antes: kashport.mark_paid + vurelo_webhook.notify_finalize (dual).
-            # Ahora: solo vurelo_webhook.notify_finalize (single source of truth).
+            # Para flow Vurelo nuevo · pasa vurelo_tx_id como external_id (backend
+            # resuelve via findById strategy 0). Para flow legacy Kashport · pasa
+            # external_id (KAMIN) + kashport_provider_id (mm_xxx).
+            primary_external_id = record.get("vurelo_tx_id") or record.get("external_id") or ""
             try:
                 wh = vurelo_webhook.notify_finalize(
-                    external_id=str(record.get("external_id") or ""),
+                    external_id=str(primary_external_id),
                     state="approved",
                     relampago_tx_id=vtrx_id,
                     kashport_item_id=str(kashport_id),
@@ -1055,9 +1463,10 @@ def _finalize_pending_kashport_marks() -> dict:
                 reason = declination or "rejected_by_relampago"
                 detail = f"Relampago state={state} · declination={declination or 'sin detalle'}"
                 # 2026-05-29 · BYPASS Kashport · solo notify Vurelo webhook
+                primary_external_id = record.get("vurelo_tx_id") or record.get("external_id") or ""
                 try:
                     wh = vurelo_webhook.notify_finalize(
-                        external_id=str(record.get("external_id") or ""),
+                        external_id=str(primary_external_id),
                         state="rejected",
                         relampago_tx_id=vtrx_id,
                         kashport_item_id=str(kashport_id),
@@ -1209,11 +1618,24 @@ def _startup(args):
         AUTO_MODE["enabled"] = saved == "1"
         print(f"· Modo restaurado de SQLite · {'AUTO' if AUTO_MODE['enabled'] else 'MANUAL'}")
 
-    # 4. Si auto + session alive · arrancar auto loop + kashport poller
+    # 4. Arrancar Vurelo backend poller SIEMPRE (UI necesita queue independiente
+    # del auto_mode · single source of truth = Vurelo backend HAv1).
+    # Solo si QUEUE_SOURCE=vurelo (default) · si legacy kashport no se arranca.
+    if QUEUE_SOURCE == "vurelo":
+        if vurelo_queue.is_configured():
+            _start_vurelo_poller()
+            print(f"▶ Vurelo backend poller arrancado · interval={VURELO_POLL_INTERVAL}s")
+        else:
+            print("⚠ QUEUE_SOURCE=vurelo · pero VURELO_API_BASE_URL/VURELO_SERVICE_API_KEY no configurados")
+
+    # 5. Si auto + session alive · arrancar auto loop + (legacy) kashport poller
     if AUTO_MODE["enabled"] and session_alive:
         _start_auto_loop()
-        _start_kashport_poller()
-        print("▶ AUTO loop + Kashport poller arrancados")
+        if QUEUE_SOURCE == "kashport":
+            _start_kashport_poller()
+            print("▶ AUTO loop + Kashport poller arrancados (legacy mode)")
+        else:
+            print(f"▶ AUTO loop arrancado (queue={QUEUE_SOURCE})")
     elif AUTO_MODE["enabled"] and not session_alive:
         print("⚠ AUTO mode ON pero session muerta · loops arrancarán tras login")
 
@@ -1230,6 +1652,7 @@ def _shutdown_handler(signum, frame):
         print(f"✗ Error al persistir · {e}")
     _auto_stop.set()
     _trueno_stop.set()
+    _vurelo_stop.set()
     sys.exit(0)
 
 

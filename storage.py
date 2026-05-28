@@ -294,26 +294,37 @@ def record_sent_dispersion(
     initial_state: str,
     request_body: dict,
     response_body: dict,
+    vurelo_tx_id: str = None,
 ):
     """2026-05-23 · awaiting_since seteado · kashport_finalized=0 default.
-    Kashport mark happens later · cuando trueno_sync detect estado final Relampago."""
+    Kashport mark happens later · cuando trueno_sync detect estado final Relampago.
+    2026-05-29 · vurelo_tx_id NEW · flow Vurelo backend (sin Kashport intermedio)."""
     now = time.time()
     iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+    # Migration on-the-fly · agregar columna vurelo_tx_id si no existe (SQLite no soporta IF NOT EXISTS en ALTER)
     with _cursor() as c:
+        try:
+            c.execute("ALTER TABLE sent_dispersions ADD COLUMN vurelo_tx_id TEXT")
+        except Exception:
+            pass  # ya existe
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sent_vurelo_tx ON sent_dispersions(vurelo_tx_id)")
+        except Exception:
+            pass
         c.execute("""
             INSERT INTO sent_dispersions
             (ts_iso, ts_epoch, kashport_id, kashport_provider_id,
              relampago_tx_id, external_id, payee_name, payee_key, payee_doc, payee_bank,
              amount_cop, rail, initial_state, current_state,
              request_json, response_json, last_state_check,
-             kashport_finalized, awaiting_since)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             kashport_finalized, awaiting_since, vurelo_tx_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             iso, now, kashport_id, kashport_provider_id,
             relampago_tx_id, external_id, payee_name, payee_key, payee_doc, payee_bank,
             amount_cop, rail, initial_state, initial_state,
             json.dumps(request_body, default=str), json.dumps(response_body, default=str), now,
-            0, now,
+            0, now, vurelo_tx_id,
         ))
 
 
@@ -336,8 +347,14 @@ def get_sent_by_kashport_id(kashport_id: str) -> dict | None:
 
 
 def list_awaiting_kashport_finalize() -> list:
-    """2026-05-23 · sent_dispersions sin kashport_finalized=0 · listas para evaluar finalize."""
+    """2026-05-23 · sent_dispersions sin kashport_finalized=0 · listas para evaluar finalize.
+    2026-05-29 · expone vurelo_tx_id si existe (flow nuevo · backend lookup directo)."""
     with _cursor() as c:
+        # Auto-migration · agregar vurelo_tx_id si no existe (idempotent)
+        try:
+            c.execute("ALTER TABLE sent_dispersions ADD COLUMN vurelo_tx_id TEXT")
+        except Exception:
+            pass
         rows = c.execute("""
             SELECT * FROM sent_dispersions
             WHERE kashport_finalized = 0

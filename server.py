@@ -989,70 +989,64 @@ def _finalize_pending_kashport_marks() -> dict:
         declination = trueno_match.get("declination_reason")
 
         if state in RELAMPAGO_STATES_FINAL_OK:
-            # FINAL OK · mark Kashport paid
+            # 2026-05-29 · BYPASS Kashport answer · solo notify Vurelo webhook.
+            # Antes: kashport.mark_paid + vurelo_webhook.notify_finalize (dual).
+            # Ahora: solo vurelo_webhook.notify_finalize (single source of truth).
             try:
-                paid = kashport.mark_paid(kashport_id, meta={
-                    "auto_via": "relampago_api_v1_async_finalize",
-                    "relampago_tx_id": vtrx_id,
-                    "external_id": record.get("external_id"),
-                    "state": state,
-                    "finalized_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-                })
-                if paid.get("ok"):
-                    # IDEMPOTENT update · solo si NO marcado antes (race protection)
+                wh = vurelo_webhook.notify_finalize(
+                    external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
+                    state="approved",
+                    relampago_tx_id=vtrx_id,
+                    kashport_item_id=str(kashport_id),
+                    amount_cop=int(record.get("amount_cop") or 0),
+                )
+                if wh.get("ok"):
+                    # IDEMPOTENT · marca local SQLite que ya cerramos este vtrx
                     if storage.mark_kashport_finalized(vtrx_id, "paid"):
                         out["marked_paid"] += 1
-                        log_event("kashport_finalized_paid", {
+                        log_event("vurelo_finalized_paid", {
                             "kashport_id": kashport_id,
                             "relampago_tx_id": vtrx_id,
                             "state": state,
                             "amount_cop": record.get("amount_cop"),
+                            "webhook_status": wh.get("status"),
                         })
-                    # 2026-05-29 · ADEMÁS notify webhook Vurelo backend HAv1
-                    # para cierre saga BREB_CASHOUT · bypass Kashport como "answer"
+                else:
+                    out["errors"].append({
+                        "vtrx": vtrx_id,
+                        "action": "vurelo_webhook_paid_failed",
+                        "webhook_response": wh,
+                    })
+                    log_event("vurelo_webhook_paid_failed", {
+                        "kashport_id": kashport_id,
+                        "relampago_tx_id": vtrx_id,
+                        "webhook": wh,
+                    })
+                    # Attention item · operador revisa
                     try:
-                        wh = vurelo_webhook.notify_finalize(
-                            external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
-                            state="approved",
+                        storage.add_attention(
+                            kind="vurelo_webhook_paid_failed",
+                            severity="critical",
                             relampago_tx_id=vtrx_id,
-                            kashport_item_id=str(kashport_id),
-                            amount_cop=int(record.get("amount_cop") or 0),
+                            external_id=record.get("external_id"),
+                            kashport_provider_id=record.get("kashport_provider_id"),
+                            payee_name=record.get("payee_name"),
+                            amount_cop=record.get("amount_cop"),
+                            description=(
+                                f"Vurelo webhook approved FALLÓ · Relampago sent OK · "
+                                f"${record.get('amount_cop'):,.0f} · saga BREB_CASHOUT NO cerrado"
+                            ),
+                            detail_json={
+                                "kashport_id": kashport_id,
+                                "vtrx_id": vtrx_id,
+                                "webhook_response": wh,
+                                "relampago_state": state,
+                            },
                         )
-                        log_event("vurelo_webhook_paid", {
-                            "kashport_id": kashport_id,
-                            "vtrx_id": vtrx_id,
-                            "ok": wh.get("ok"),
-                            "status": wh.get("status"),
-                            "body": wh.get("body", "")[:200],
-                            "error": wh.get("error"),
-                        })
-                        if not wh.get("ok"):
-                            # Webhook fail · escalar attention_items (no bloquear flow)
-                            try:
-                                storage.add_attention(
-                                    kind="vurelo_webhook_paid_failed",
-                                    severity="warn",
-                                    relampago_tx_id=vtrx_id,
-                                    external_id=record.get("external_id"),
-                                    kashport_provider_id=record.get("kashport_provider_id"),
-                                    payee_name=record.get("payee_name"),
-                                    amount_cop=record.get("amount_cop"),
-                                    description=(
-                                        f"Vurelo webhook paid FALLÓ · Kashport OK pero "
-                                        f"saga BREB_CASHOUT HAv1 NO cerrado · revisar"
-                                    ),
-                                    detail_json={
-                                        "kashport_id": kashport_id,
-                                        "vtrx_id": vtrx_id,
-                                        "webhook_response": wh,
-                                    },
-                                )
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        log_event("vurelo_webhook_paid_exception", {
-                            "kashport_id": kashport_id, "vtrx_id": vtrx_id, "error": str(e),
-                        })
+                    except Exception:
+                        pass
+            except Exception as e:
+                out["errors"].append({"vtrx": vtrx_id, "error": f"vurelo_webhook_paid_exception: {e}"})
                 else:
                     out["errors"].append({
                         "vtrx": vtrx_id,
@@ -1095,62 +1089,64 @@ def _finalize_pending_kashport_marks() -> dict:
             try:
                 reason = declination or "rejected_by_relampago"
                 detail = f"Relampago state={state} · declination={declination or 'sin detalle'}"
-                rej = kashport.mark_rejected(kashport_id, reason=reason, detail=detail)
-                if rej.get("ok"):
-                    if storage.mark_kashport_finalized(vtrx_id, "rejected"):
-                        out["marked_rejected"] += 1
-                        log_event("kashport_finalized_rejected", {
+                # 2026-05-29 · BYPASS Kashport · solo notify Vurelo webhook
+                try:
+                    wh = vurelo_webhook.notify_finalize(
+                        external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
+                        state="rejected",
+                        relampago_tx_id=vtrx_id,
+                        kashport_item_id=str(kashport_id),
+                        amount_cop=int(record.get("amount_cop") or 0),
+                        reason=reason,
+                        detail=detail,
+                    )
+                    if wh.get("ok"):
+                        if storage.mark_kashport_finalized(vtrx_id, "rejected"):
+                            out["marked_rejected"] += 1
+                            log_event("vurelo_finalized_rejected", {
+                                "kashport_id": kashport_id,
+                                "relampago_tx_id": vtrx_id,
+                                "state": state,
+                                "declination": declination,
+                                "amount_cop": record.get("amount_cop"),
+                                "webhook_status": wh.get("status"),
+                            })
+                    else:
+                        out["errors"].append({
+                            "vtrx": vtrx_id,
+                            "action": "vurelo_webhook_rejected_failed",
+                            "webhook_response": wh,
+                        })
+                        log_event("vurelo_webhook_rejected_failed", {
                             "kashport_id": kashport_id,
                             "relampago_tx_id": vtrx_id,
-                            "state": state,
-                            "declination": declination,
-                            "amount_cop": record.get("amount_cop"),
+                            "webhook": wh,
                         })
-                    # 2026-05-29 · webhook Vurelo backend HAv1 · release hold + REJECTED
-                    try:
-                        wh = vurelo_webhook.notify_finalize(
-                            external_id=str(record.get("external_id") or record.get("kashport_provider_id") or ""),
-                            state="rejected",
-                            relampago_tx_id=vtrx_id,
-                            kashport_item_id=str(kashport_id),
-                            amount_cop=int(record.get("amount_cop") or 0),
-                            reason=reason,
-                            detail=detail,
-                        )
-                        log_event("vurelo_webhook_rejected", {
-                            "kashport_id": kashport_id,
-                            "vtrx_id": vtrx_id,
-                            "ok": wh.get("ok"),
-                            "status": wh.get("status"),
-                            "body": wh.get("body", "")[:200],
-                            "error": wh.get("error"),
-                        })
-                        if not wh.get("ok"):
-                            try:
-                                storage.add_attention(
-                                    kind="vurelo_webhook_rejected_failed",
-                                    severity="warn",
-                                    relampago_tx_id=vtrx_id,
-                                    external_id=record.get("external_id"),
-                                    kashport_provider_id=record.get("kashport_provider_id"),
-                                    payee_name=record.get("payee_name"),
-                                    amount_cop=record.get("amount_cop"),
-                                    description=(
-                                        f"Vurelo webhook rejected FALLÓ · Kashport rejected OK "
-                                        f"pero saga HAv1 sin cerrar · revisar release hold"
-                                    ),
-                                    detail_json={
-                                        "kashport_id": kashport_id,
-                                        "vtrx_id": vtrx_id,
-                                        "webhook_response": wh,
-                                    },
-                                )
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        log_event("vurelo_webhook_rejected_exception", {
-                            "kashport_id": kashport_id, "vtrx_id": vtrx_id, "error": str(e),
-                        })
+                        try:
+                            storage.add_attention(
+                                kind="vurelo_webhook_rejected_failed",
+                                severity="critical",
+                                relampago_tx_id=vtrx_id,
+                                external_id=record.get("external_id"),
+                                kashport_provider_id=record.get("kashport_provider_id"),
+                                payee_name=record.get("payee_name"),
+                                amount_cop=record.get("amount_cop"),
+                                description=(
+                                    f"Vurelo webhook rejected FALLÓ · Relampago decline OK "
+                                    f"pero saga HAv1 sin cerrar · revisar release hold"
+                                ),
+                                detail_json={
+                                    "kashport_id": kashport_id,
+                                    "vtrx_id": vtrx_id,
+                                    "webhook_response": wh,
+                                    "relampago_state": state,
+                                    "declination": declination,
+                                },
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    out["errors"].append({"vtrx": vtrx_id, "error": f"vurelo_webhook_rejected_exception: {e}"})
 
                         # Attention item para audit · severity warn (operator review)
                         try:

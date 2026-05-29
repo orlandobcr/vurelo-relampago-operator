@@ -1083,6 +1083,24 @@ def api_reject(item_id):
     })
 
 
+@app.route("/api/ops/debug-cookies")
+def api_ops_debug_cookies():
+    """Debug · expone cookies recibidas + headers relevantes para troubleshoot auth bounce."""
+    return jsonify({
+        "ok": True,
+        "cookies_received": dict(request.cookies),
+        "x_forwarded_proto": request.headers.get("X-Forwarded-Proto"),
+        "x_forwarded_host": request.headers.get("X-Forwarded-Host"),
+        "host": request.headers.get("Host"),
+        "is_secure": request.is_secure,
+        "scheme": request.scheme,
+        "url_root": request.url_root,
+        "auth_cookie_present": gauth.AUTH_COOKIE_NAME in request.cookies,
+        "auth_secret_len": len(gauth.SECRET) if gauth.SECRET else 0,
+        "secret_source": "env" if os.environ.get("AUTH_SECRET", "").strip() else "file",
+    })
+
+
 @app.route("/api/ops/recent-events")
 def api_ops_recent_events():
     """Service endpoint · x-api-key auth · expone EVENT_LOG en memoria para debug."""

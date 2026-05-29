@@ -1083,6 +1083,42 @@ def api_reject(item_id):
     })
 
 
+@app.route("/api/ops/recent-events")
+def api_ops_recent_events():
+    """Service endpoint · x-api-key auth · expone EVENT_LOG en memoria para debug."""
+    limit = int(request.args.get("limit", "200"))
+    grep = request.args.get("grep", "").lower()
+    items = list(EVENT_LOG[-limit:])
+    if grep:
+        items = [e for e in items if grep in e.get("kind","").lower() or grep in str(e.get("payload","")).lower()]
+    return jsonify({"ok": True, "count": len(items), "items": items})
+
+
+@app.route("/api/ops/recent-sent")
+def api_ops_recent_sent():
+    """Service endpoint · x-api-key auth · lista sent_dispersions recientes."""
+    limit = int(request.args.get("limit", "20"))
+    vurelo_tx_id = request.args.get("vurelo_tx_id")
+    import sqlite3
+    try:
+        conn = sqlite3.connect(storage.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        try:
+            cur.execute("ALTER TABLE sent_dispersions ADD COLUMN vurelo_tx_id TEXT")
+        except Exception:
+            pass
+        if vurelo_tx_id:
+            rows = cur.execute("SELECT * FROM sent_dispersions WHERE vurelo_tx_id = ? OR kashport_id = ? ORDER BY ts_epoch DESC LIMIT ?", (vurelo_tx_id, vurelo_tx_id, limit)).fetchall()
+        else:
+            rows = cur.execute("SELECT * FROM sent_dispersions ORDER BY ts_epoch DESC LIMIT ?", (limit,)).fetchall()
+        items = [dict(r) for r in rows]
+        conn.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "count": len(items), "items": items})
+
+
 @app.route("/api/ops/recent-rejects")
 def api_ops_recent_rejects():
     """

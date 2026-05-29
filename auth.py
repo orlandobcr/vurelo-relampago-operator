@@ -129,11 +129,17 @@ def require_auth():
     """
     Hook para usar en before_request del Flask app.
     Bloquea TODO endpoint que no esté en EXEMPT_PREFIXES.
-    · API routes → JSON 401
+    · API routes → JSON 401 · excepto /api/ops/* que aceptan x-api-key
     · Pages → redirect /login?next=<path>
     """
     if is_exempt(request.path):
         return None
+    # 2026-05-29 · service-to-service · endpoints /api/ops/* aceptan x-api-key
+    if request.path.startswith("/api/ops/"):
+        provided = request.headers.get("x-api-key", "")
+        expected = os.environ.get("VURELO_SERVICE_API_KEY", "")
+        if expected and provided and hmac.compare_digest(provided, expected):
+            return None
     user = get_current_user()
     if user:
         return None

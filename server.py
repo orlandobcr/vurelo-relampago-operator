@@ -1079,6 +1079,44 @@ def api_reject(item_id):
     })
 
 
+@app.route("/api/ops/recent-rejects")
+def api_ops_recent_rejects():
+    """
+    Service endpoint · x-api-key auth · lista attention_items con kind LIKE
+    'manual_reject%' de los últimos N minutos · para que backend identifique
+    qué txs marcó el operador como rechazadas.
+    """
+    minutes = int(request.args.get("minutes", "30"))
+    cutoff = time.time() - (minutes * 60)
+    import sqlite3
+    rows = []
+    try:
+        conn = sqlite3.connect(storage.DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        result = cur.execute("""
+            SELECT id, ts_iso, ts_epoch, kind, severity,
+                   relampago_tx_id, external_id, kashport_provider_id,
+                   payee_name, amount_cop, description, detail_json
+            FROM attention_items
+            WHERE kind LIKE 'manual_reject%'
+              AND ts_epoch >= ?
+            ORDER BY ts_epoch DESC
+        """, (cutoff,))
+        for r in result.fetchall():
+            d = dict(r)
+            # detail_json es TEXT · parse
+            try:
+                d["detail"] = json.loads(d.pop("detail_json") or "{}")
+            except Exception:
+                d["detail"] = {}
+            rows.append(d)
+        conn.close()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "count": len(rows), "items": rows})
+
+
 @app.route("/api/sent")
 def api_sent():
     """Lista de dispersiones enviadas vía esta app (persistidas en SQLite)."""

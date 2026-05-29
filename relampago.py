@@ -342,6 +342,197 @@ class RelampagoSession:
             "token_expires_at": self._token_expires_at,
         }
 
+    # ============ Auto-login con pin service externo ============
+    #
+    # Permite a la app re-autenticarse sola cuando la sesión Relampago se pierde
+    # (refresh loop agotó retries · cookies expiraron mientras estaba dormido · etc).
+    # Necesita un pin-service HTTP que devuelva el TOTP actual (lo construimos
+    # aparte sobre el share link 1Password con Playwright headless stealth).
+    #
+    # Configuración via server.py (env vars):
+    #   RELAMPAGO_AUTO_LOGIN_ENABLED=1
+    #   RELAMPAGO_AUTO_LOGIN_EMAIL=otc@vureloapp.com
+    #   RELAMPAGO_AUTO_LOGIN_PASSWORD=...
+    #   RELAMPAGO_PIN_SERVICE_URL=http://10.100.20.84:7321/pin
+    #   RELAMPAGO_PIN_SERVICE_TOKEN=<bearer>
+
+    def _fetch_pin_from_service(self, pin_url: str, pin_token: str) -> dict:
+        """GET al pin-service · devuelve {ok, pin?, error?, ts?}."""
+        try:
+            r = requests.get(
+                pin_url,
+                headers={"Authorization": f"Bearer {pin_token}"},
+                timeout=10,
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"network · {e}"}
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code} · {r.text[:200]}"}
+        try:
+            body = r.json()
+        except Exception:
+            return {"ok": False, "error": f"non-json · {r.text[:200]}"}
+        pin = (body.get("pin") or "").strip()
+        if not pin or not pin.isdigit() or len(pin) != 6:
+            return {"ok": False, "error": f"pin inválido · {pin!r}"}
+        return {"ok": True, "pin": pin, "ts": body.get("ts")}
+
+    def auto_login_with_pin_service(
+        self,
+        email: str,
+        password: str,
+        pin_url: str,
+        pin_token: str,
+        max_attempts: int = 3,
+    ) -> dict:
+        """Login completo end-to-end · password + MFA via pin-service externo.
+
+        Reintenta hasta `max_attempts` si el PIN expira entre fetch y submit
+        (caso esquina · TOTP rota cada 30s · pin viejo da invalid_mfa).
+        """
+        last_detail = None
+        for attempt in range(1, max_attempts + 1):
+            r1 = self.login_password(email, password)
+            if not r1.get("ok"):
+                self._add_history({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "AUTO_LOGIN_PASSWORD_FAIL",
+                    "attempt": attempt,
+                    "error": r1.get("error"),
+                })
+                return {"ok": False, "step": "password", "attempts": attempt, "detail": r1}
+
+            r_pin = self._fetch_pin_from_service(pin_url, pin_token)
+            if not r_pin.get("ok"):
+                self._add_history({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "AUTO_LOGIN_PIN_FETCH_FAIL",
+                    "attempt": attempt,
+                    "error": r_pin.get("error"),
+                })
+                return {"ok": False, "step": "pin_fetch", "attempts": attempt, "detail": r_pin}
+
+            r2 = self.login_mfa(r_pin["pin"])
+            if r2.get("ok"):
+                self._add_history({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "AUTO_LOGIN_OK",
+                    "attempt": attempt,
+                    "expires_in": r2.get("expires_in_seconds"),
+                })
+                return {
+                    "ok": True,
+                    "step": "complete",
+                    "attempts": attempt,
+                    "pin_ts": r_pin.get("ts"),
+                    "expires_in_seconds": r2.get("expires_in_seconds"),
+                }
+
+            last_detail = r2
+            # invalid_mfa probablemente es que el PIN expiró entre fetch y submit:
+            # esperar 2s y reintentar con PIN fresh (idealmente cruza el window boundary)
+            if r2.get("error") == "invalid_mfa" and attempt < max_attempts:
+                self._add_history({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "AUTO_LOGIN_MFA_RETRY",
+                    "attempt": attempt,
+                })
+                time.sleep(2)
+                continue
+            self._add_history({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "AUTO_LOGIN_MFA_FAIL",
+                "attempt": attempt,
+                "error": r2.get("error"),
+            })
+            return {"ok": False, "step": "mfa", "attempts": attempt, "detail": r2}
+
+        return {"ok": False, "step": "mfa_max_attempts", "attempts": max_attempts, "detail": last_detail}
+
+    def start_auto_login_watchdog(
+        self,
+        email: str,
+        password: str,
+        pin_url: str,
+        pin_token: str,
+        check_interval: int = 30,
+        cooldown_after_fail: int = 60,
+    ) -> None:
+        """Arranca thread que monitorea `is_logged_in` y auto-relogin cuando cae.
+
+        Idempotente · si ya hay watchdog vivo no arranca otro.
+        """
+        existing = getattr(self, "_autologin_thread", None)
+        if existing and existing.is_alive():
+            return
+        self._autologin_config = {
+            "email": email,
+            "password": password,
+            "pin_url": pin_url,
+            "pin_token": pin_token,
+            "check_interval": check_interval,
+            "cooldown_after_fail": cooldown_after_fail,
+        }
+        self._autologin_stop = threading.Event()
+        self._autologin_last_attempt_at = None
+        self._autologin_last_result = None
+
+        def loop():
+            print(f"▶ Auto-login watchdog ON · interval={check_interval}s · email={email}")
+            while not self._autologin_stop.is_set():
+                try:
+                    if not self.is_logged_in:
+                        print(f"⚠ Watchdog · sesión Relampago caída · auto-login...")
+                        self._autologin_last_attempt_at = time.time()
+                        r = self.auto_login_with_pin_service(email, password, pin_url, pin_token)
+                        self._autologin_last_result = r
+                        if r.get("ok"):
+                            print(
+                                f"✓ Auto-login OK · attempts={r.get('attempts')} "
+                                f"· expires_in={r.get('expires_in_seconds')}s"
+                            )
+                        else:
+                            print(
+                                f"✗ Auto-login FAIL · step={r.get('step')} "
+                                f"attempts={r.get('attempts')} · cooldown {cooldown_after_fail}s"
+                            )
+                            if self._autologin_stop.wait(cooldown_after_fail):
+                                break
+                            continue
+                except Exception as e:
+                    print(f"⚠ Watchdog inner exception · {e}")
+                if self._autologin_stop.wait(check_interval):
+                    break
+            print("· Auto-login watchdog stopped")
+
+        self._autologin_thread = threading.Thread(
+            target=loop, daemon=True, name="relampago-autologin-watchdog"
+        )
+        self._autologin_thread.start()
+
+    def stop_auto_login_watchdog(self) -> None:
+        """Detiene el watchdog · safe si nunca arrancó."""
+        if hasattr(self, "_autologin_stop"):
+            self._autologin_stop.set()
+
+    def autologin_status(self) -> dict:
+        """Snapshot del watchdog · seguro para exponer en /api/status."""
+        cfg = getattr(self, "_autologin_config", None)
+        thr = getattr(self, "_autologin_thread", None)
+        last_r = getattr(self, "_autologin_last_result", None)
+        return {
+            "enabled": cfg is not None,
+            "running": bool(thr and thr.is_alive()),
+            "email": cfg.get("email") if cfg else None,
+            "pin_service_url": cfg.get("pin_url") if cfg else None,
+            "check_interval_s": cfg.get("check_interval") if cfg else None,
+            "last_attempt_at": getattr(self, "_autologin_last_attempt_at", None),
+            "last_result": (
+                {"ok": last_r.get("ok"), "step": last_r.get("step"), "attempts": last_r.get("attempts")}
+                if last_r else None
+            ),
+        }
+
     # ============ Refresh loop ============
 
     def _start_refresh_loop(self):

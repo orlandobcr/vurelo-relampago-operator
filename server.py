@@ -56,6 +56,20 @@ LOG_MAX = 200
 
 # 2026-05-29 · queue source · ÚNICO · Vurelo backend HAv1 (legacy Kashport eliminado)
 QUEUE_SOURCE = "vurelo"  # forced · ignora env por seguridad · NO más Kashport
+
+# 2026-05-29 · Auto-login config · re-login automático cuando la sesión Relampago cae.
+# Usa el pin-service (deploy aparte en worker2:7321) que expone el TOTP del 1Password share.
+RELAMPAGO_AUTO_LOGIN_ENABLED = os.environ.get("RELAMPAGO_AUTO_LOGIN_ENABLED", "0") == "1"
+RELAMPAGO_AUTO_LOGIN_EMAIL = os.environ.get("RELAMPAGO_AUTO_LOGIN_EMAIL", "").strip()
+RELAMPAGO_AUTO_LOGIN_PASSWORD = os.environ.get("RELAMPAGO_AUTO_LOGIN_PASSWORD", "")
+RELAMPAGO_PIN_SERVICE_URL = os.environ.get(
+    "RELAMPAGO_PIN_SERVICE_URL", "http://10.100.20.84:7321/pin"
+).strip()
+RELAMPAGO_PIN_SERVICE_TOKEN = os.environ.get("RELAMPAGO_PIN_SERVICE_TOKEN", "").strip()
+RELAMPAGO_AUTO_LOGIN_CHECK_INTERVAL = int(
+    os.environ.get("RELAMPAGO_AUTO_LOGIN_CHECK_INTERVAL", "30")
+)
+
 VURELO_CACHE = {
     "ok": None,
     "data": None,
@@ -264,6 +278,61 @@ def api_logout():
     relampago.logout()
     log_event("logout", {})
     return jsonify({"ok": True})
+
+
+@app.route("/api/auto-login/trigger", methods=["POST"])
+def api_auto_login_trigger():
+    """Dispara un auto-login manual (password + pin-service) sin esperar al watchdog.
+    Útil para diagnóstico o re-login inmediato tras config change.
+    """
+    if not RELAMPAGO_AUTO_LOGIN_ENABLED:
+        return jsonify({"ok": False, "error": "auto_login_disabled"}), 400
+    if not all([RELAMPAGO_AUTO_LOGIN_EMAIL, RELAMPAGO_AUTO_LOGIN_PASSWORD,
+                RELAMPAGO_PIN_SERVICE_URL, RELAMPAGO_PIN_SERVICE_TOKEN]):
+        return jsonify({"ok": False, "error": "auto_login_misconfigured"}), 400
+    r = relampago.auto_login_with_pin_service(
+        RELAMPAGO_AUTO_LOGIN_EMAIL,
+        RELAMPAGO_AUTO_LOGIN_PASSWORD,
+        RELAMPAGO_PIN_SERVICE_URL,
+        RELAMPAGO_PIN_SERVICE_TOKEN,
+    )
+    log_event("auto_login_manual", {"ok": r.get("ok"), "step": r.get("step"), "attempts": r.get("attempts")})
+    if r.get("ok"):
+        # Arrancar loops igual que post-MFA manual
+        try:
+            _start_trueno_sync()
+        except Exception:
+            pass
+        if QUEUE_SOURCE == "vurelo" and vurelo_queue.is_configured():
+            try:
+                _start_vurelo_poller()
+            except Exception:
+                pass
+        if AUTO_MODE["enabled"]:
+            try:
+                _start_auto_loop()
+            except Exception:
+                pass
+    return jsonify(r)
+
+
+@app.route("/api/auto-login/status")
+def api_auto_login_status():
+    """Snapshot del watchdog auto-login · seguro para UI."""
+    return jsonify({
+        "config": {
+            "enabled": RELAMPAGO_AUTO_LOGIN_ENABLED,
+            "email": RELAMPAGO_AUTO_LOGIN_EMAIL or None,
+            "pin_service_url": RELAMPAGO_PIN_SERVICE_URL or None,
+            "check_interval_s": RELAMPAGO_AUTO_LOGIN_CHECK_INTERVAL,
+            "credentials_set": bool(RELAMPAGO_AUTO_LOGIN_PASSWORD and RELAMPAGO_PIN_SERVICE_TOKEN),
+        },
+        "watchdog": relampago.autologin_status(),
+        "session": {
+            "is_logged_in": relampago.is_logged_in,
+            "last_login_email": relampago._last_login_email,
+        },
+    })
 
 
 @app.route("/api/refresh-history")
@@ -1685,9 +1754,55 @@ def _startup(args):
             print(f"✓ Sesión Relampago VIVA · refresh count={relampago._refresh_count}")
             _start_trueno_sync()
         else:
-            print("✗ Sesión Relampago muerta · UI pedirá re-login")
+            print("✗ Sesión Relampago muerta · auto-login lo levantará (si está habilitado)")
     else:
-        print("· Sin sesión previa · UI pedirá login")
+        print("· Sin sesión previa · auto-login lo levantará (si está habilitado)")
+
+    # 2.1 · Auto-login (si está habilitado y tenemos credenciales + pin-service)
+    if RELAMPAGO_AUTO_LOGIN_ENABLED:
+        missing = [
+            k for k, v in {
+                "EMAIL": RELAMPAGO_AUTO_LOGIN_EMAIL,
+                "PASSWORD": RELAMPAGO_AUTO_LOGIN_PASSWORD,
+                "PIN_SERVICE_URL": RELAMPAGO_PIN_SERVICE_URL,
+                "PIN_SERVICE_TOKEN": RELAMPAGO_PIN_SERVICE_TOKEN,
+            }.items() if not v
+        ]
+        if missing:
+            print(f"⚠ RELAMPAGO_AUTO_LOGIN_ENABLED=1 pero faltan: {missing} · watchdog NO arranca")
+        else:
+            # Si la sesión está muerta, intentar login sincrónico AHORA para que
+            # los loops (auto · vurelo poller) arranquen con sesión viva.
+            if not session_alive:
+                print("· Auto-login sincrónico inicial...")
+                r = relampago.auto_login_with_pin_service(
+                    RELAMPAGO_AUTO_LOGIN_EMAIL,
+                    RELAMPAGO_AUTO_LOGIN_PASSWORD,
+                    RELAMPAGO_PIN_SERVICE_URL,
+                    RELAMPAGO_PIN_SERVICE_TOKEN,
+                )
+                if r.get("ok"):
+                    session_alive = True
+                    print(
+                        f"✓ Auto-login OK · attempts={r.get('attempts')} "
+                        f"· expires_in={r.get('expires_in_seconds')}s"
+                    )
+                    try:
+                        _start_trueno_sync()
+                    except Exception as e:
+                        print(f"⚠ _start_trueno_sync post auto-login · {e}")
+                else:
+                    print(f"✗ Auto-login inicial FAIL · {r.get('step')} · watchdog reintentará")
+            # Arrancar watchdog (idempotente · si re-fail levanta solito)
+            relampago.start_auto_login_watchdog(
+                RELAMPAGO_AUTO_LOGIN_EMAIL,
+                RELAMPAGO_AUTO_LOGIN_PASSWORD,
+                RELAMPAGO_PIN_SERVICE_URL,
+                RELAMPAGO_PIN_SERVICE_TOKEN,
+                check_interval=RELAMPAGO_AUTO_LOGIN_CHECK_INTERVAL,
+            )
+    else:
+        print("· RELAMPAGO_AUTO_LOGIN_ENABLED=0 · solo login manual via UI")
 
     # 3. Resolver auto_mode (CLI flag > DB > default manual)
     if args.auto:

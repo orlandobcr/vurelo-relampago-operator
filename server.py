@@ -177,7 +177,13 @@ def auth_google_callback():
                     max_age=gauth.AUTH_TTL_SECONDS, path="/")
     resp.delete_cookie(OAUTH_STATE_COOKIE)
     resp.delete_cookie(OAUTH_NEXT_COOKIE)
-    log_event("google_login", {"email": profile["email"]})
+    log_event("google_login", {
+        "email": profile["email"],
+        "cookie_len": len(session_cookie),
+        "secure_flag": secure,
+        "next_url": next_url,
+        "set_cookie_headers": [v for k, v in resp.headers.items() if k.lower() == "set-cookie"],
+    })
     return resp
 
 

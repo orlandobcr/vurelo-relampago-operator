@@ -1009,44 +1009,74 @@ def api_process_vurelo(tx_id):
 @app.route("/api/reject/<item_id>", methods=["POST"])
 def api_reject(item_id):
     """
-    Manual reject desde UI · POST sin body a Kashport (igual extension v0.3).
-    Si llega un body con reason · pasarlo (caso edge donde se especifica razón).
-    2026-05-23 audit GAP fix · attention_items severity=info para audit trail completo.
+    Manual reject desde UI · 2026-05-29 · notifica DIRECTO al backend Vurelo
+    (NO Kashport · bypass total). item_id = Vurelo tx_id (trx_xxx) o legacy
+    Kashport queue item id (UI nueva siempre envía trx_xxx · legacy mantiene
+    compat).
+
+    Backend:
+      - Strategy 0 · findById(trx_xxx) match
+      - Release hold + mark REJECTED
+      - User app ve tx finalizada · saldo restaurado
     """
     body = request.get_json(force=True, silent=True) or {}
-    reason = body.get("reason", "")  # vacío default · igual a extension
-    detail = body.get("detail", "")
-    result = kashport.mark_rejected(item_id, reason=reason, detail=detail)
-    if result.get("ok"):
-        COMPLETED_IDS.add(item_id)
-    log_event("manual_reject", {
-        "item_id": item_id,
+    reason = body.get("reason") or "manual_reject_ops"
+    detail = body.get("detail") or f"Rechazado manualmente desde UI Relámpago · item={item_id}"
+
+    # Notify Vurelo webhook
+    try:
+        wh = vurelo_webhook.notify_finalize(
+            external_id=item_id,   # trx_xxx · backend strategy 0 findById
+            state="rejected",
+            relampago_tx_id="",
+            kashport_item_id=None,
+            kashport_provider_id=None,
+            amount_cop=int(body.get("amount_cop") or 0),
+            reason=reason,
+            detail=detail,
+        )
+    except Exception as e:
+        log_event("manual_reject_exception", {"item_id": item_id, "error": str(e)})
+        return jsonify({"ok": False, "error": "webhook_exception", "detail": str(e)})
+
+    log_event("manual_reject_vurelo", {
+        "tx_id": item_id,
         "reason": reason,
-        "detail": detail,
-        "result": result,
+        "detail": detail[:200],
+        "webhook_ok": wh.get("ok"),
+        "webhook_status": wh.get("status"),
     })
-    # 2026-05-23 audit · attention_items para tracking todos los rejects
+
+    if wh.get("ok"):
+        COMPLETED_IDS.add(item_id)
+
+    # Audit attention item
     try:
         storage.add_attention(
-            kind="manual_reject",
+            kind="manual_reject_vurelo",
             severity="info",
             relampago_tx_id=None,
-            external_id=None,
+            external_id=item_id,
             kashport_provider_id=None,
             payee_name=None,
-            amount_cop=None,
-            description=f"Manual reject Kashport · item={item_id} · reason={reason or 'sin reason'}",
+            amount_cop=body.get("amount_cop"),
+            description=f"Manual reject Vurelo backend · tx={item_id} · reason={reason}",
             detail_json={
-                "kashport_id": item_id,
+                "tx_id": item_id,
                 "reason": reason,
                 "detail": detail,
-                "kashport_response": result,
-                "kashport_ok": result.get("ok"),
+                "webhook_response": wh,
             },
         )
     except Exception as e:
-        log_event("attention_persist_error", {"error": str(e), "context": "manual_reject"})
-    return jsonify(result)
+        log_event("attention_persist_error", {"error": str(e), "context": "manual_reject_vurelo"})
+
+    return jsonify({
+        "ok": bool(wh.get("ok")),
+        "tx_id": item_id,
+        "webhook": wh,
+        "message": "Tx marcada REJECTED en backend Vurelo · hold liberado · user ve tx finalizada" if wh.get("ok") else "Webhook FALLÓ · revisar logs",
+    })
 
 
 @app.route("/api/sent")

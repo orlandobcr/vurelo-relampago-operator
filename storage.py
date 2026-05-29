@@ -346,6 +346,26 @@ def get_sent_by_kashport_id(kashport_id: str) -> dict | None:
         return dict(row) if row else None
 
 
+def find_sent_by_vurelo_tx_id(vurelo_tx_id: str):
+    """2026-05-29 · check si ya despachamos este tx_id (Vurelo flow).
+    Crítico para prevenir doble dispatch tras container restart."""
+    if not vurelo_tx_id:
+        return None
+    with _cursor() as c:
+        # Auto-migration · idempotent
+        try:
+            c.execute("ALTER TABLE sent_dispersions ADD COLUMN vurelo_tx_id TEXT")
+        except Exception:
+            pass
+        row = c.execute("""
+            SELECT id, ts_iso, relampago_tx_id, current_state, amount_cop
+            FROM sent_dispersions
+            WHERE vurelo_tx_id = ?
+            ORDER BY ts_epoch DESC LIMIT 1
+        """, (vurelo_tx_id,)).fetchone()
+        return dict(row) if row else None
+
+
 def list_awaiting_kashport_finalize() -> list:
     """2026-05-23 · sent_dispersions sin kashport_finalized=0 · listas para evaluar finalize.
     2026-05-29 · expone vurelo_tx_id si existe (flow nuevo · backend lookup directo)."""

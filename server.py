@@ -54,8 +54,8 @@ FAILED_IDS = {}              # id → attempts
 EVENT_LOG = []               # últimos eventos · UI debug
 LOG_MAX = 200
 
-# 2026-05-29 · queue source · "vurelo" (default · nuevo · backend HAv1) o "kashport" (legacy)
-QUEUE_SOURCE = os.environ.get("QUEUE_SOURCE", "vurelo").lower()
+# 2026-05-29 · queue source · ÚNICO · Vurelo backend HAv1 (legacy Kashport eliminado)
+QUEUE_SOURCE = "vurelo"  # forced · ignora env por seguridad · NO más Kashport
 VURELO_CACHE = {
     "ok": None,
     "data": None,
@@ -533,30 +533,25 @@ def api_queue():
             "source": "vurelo",
         })
 
-    # QUEUE_SOURCE = 'kashport' · legacy
-    if AUTO_MODE["enabled"] and KASHPORT_CACHE["data"] is not None:
-        annotated = _annotate_queue_with_rules(KASHPORT_CACHE["data"] or {"items": [], "count": 0})
-        return jsonify({
-            "ok": KASHPORT_CACHE["ok"],
-            "data": annotated,
-            "fetched_at": KASHPORT_CACHE["fetched_at"],
-            "from_cache": True,
-            "source": "kashport",
-            "error": KASHPORT_CACHE.get("error"),
-        })
-    # AUTO OFF · fetch directo
-    resp = kashport.pending()
-    if resp.get("ok"):
-        resp["data"] = _annotate_queue_with_rules(resp["data"])
-    return jsonify(resp)
+    # Unreachable · QUEUE_SOURCE forced "vurelo" arriba
+    return jsonify({"ok": False, "error": "unreachable", "source": QUEUE_SOURCE})
 
 
 @app.route("/api/process/<item_id>", methods=["POST"])
 def api_process(item_id):
     """
-    Procesar UN item · validate llave + execute dispersión + mark-paid.
-    Si llave inválida · auto-mark-rejected.
+    2026-05-29 · LEGACY DISABLED · Kashport flow eliminado.
+    Usar /api/process-vurelo/<tx_id> (flow nuevo · backend HAv1 queue).
     """
+    return jsonify({
+        "ok": False,
+        "error": "legacy_kashport_flow_disabled",
+        "message": "Use /api/process-vurelo/<tx_id> · backend Vurelo es source of truth",
+    }), 410
+
+
+def _legacy_api_process_disabled(item_id):
+    """Code legacy preservado por referencia · no se invoca."""
     # Hard guard · submit-once
     if item_id in PROCESSED_IDS or item_id in COMPLETED_IDS:
         return jsonify({
@@ -795,6 +790,25 @@ def api_process_vurelo(tx_id):
             "error": "already_processed",
             "message": "Item ya fue procesado en esta sesión",
         })
+
+    # PERSISTENT GUARD (sobrevive restart) · busca si ya hay sent_dispersion con
+    # este vurelo_tx_id (cualquier momento previo). Si SÍ existe · skip duplicate.
+    try:
+        existing_sent = storage.find_sent_by_vurelo_tx_id(tx_id)
+        if existing_sent:
+            log_event("vurelo_dup_skip_persistent", {
+                "tx_id": tx_id,
+                "previous_vtrx": existing_sent.get("relampago_tx_id"),
+                "previous_ts": existing_sent.get("ts_iso"),
+            })
+            return jsonify({
+                "ok": False,
+                "error": "already_dispatched_persistent",
+                "message": "Ya existe sent_dispersion para este tx_id · NO re-dispatch",
+                "previous_vtrx": existing_sent.get("relampago_tx_id"),
+            })
+    except Exception as e:
+        log_event("dup_check_error", {"tx_id": tx_id, "error": str(e)})
 
     if not relampago.is_logged_in:
         return jsonify({"ok": False, "error": "not_logged_in"})
@@ -1124,13 +1138,10 @@ KASHPORT_POLL_INTERVAL = 30  # seconds · configurable
 
 
 def _start_kashport_poller():
-    global _kashport_thread
-    if _kashport_thread and _kashport_thread.is_alive():
-        return
-    _kashport_stop.clear()
-    _kashport_thread = threading.Thread(target=_kashport_poller_loop, daemon=True, name="kashport-poller")
-    _kashport_thread.start()
-    log_event("kashport_poller_started", {"interval_s": KASHPORT_POLL_INTERVAL})
+    """2026-05-29 · LEGACY REMOVED · ya no se usa Kashport queue (bypass total).
+    Mantenido como no-op para que rutas legacy que lo invoquen no crasheen."""
+    log_event("kashport_poller_legacy_skipped", {"reason": "vurelo_only_mode"})
+    return
 
 
 # ============ Vurelo backend queue poller · 2026-05-29 · NEW ============
@@ -1200,50 +1211,10 @@ def _vurelo_poller_loop():
 
 
 def _kashport_poller_loop():
-    """
-    Poller Kashport · ACTIVO SOLO cuando AUTO mode ON.
-    Cache resultado · UI lee de aquí cuando activo.
-    Procesamiento separado en _auto_loop (que lee del cache).
-    Si AUTO se apaga · poller termina (kashport NO consulta más a nivel servicio).
-    """
-    while not _kashport_stop.is_set():
-        if not AUTO_MODE["enabled"]:
-            # AUTO apagado · terminar poller
-            log_event("kashport_poller_stopped", {"reason": "auto_off"})
-            break
-        if kashport.configured:
-            try:
-                r = kashport.pending()
-                if r.get("ok"):
-                    new_count = r["data"].get("count", 0)
-                    prev_count = KASHPORT_CACHE.get("last_item_count", 0)
-                    KASHPORT_CACHE.update({
-                        "ok": True,
-                        "data": r["data"],
-                        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-                        "fetched_epoch": time.time(),
-                        "consecutive_errors": 0,
-                        "error": None,
-                        "last_item_count": new_count,
-                    })
-                    # Log si hay cambios en cantidad (nuevos items o procesados)
-                    if new_count != prev_count:
-                        log_event("kashport_queue_changed", {
-                            "prev": prev_count, "now": new_count, "delta": new_count - prev_count,
-                        })
-                else:
-                    KASHPORT_CACHE["consecutive_errors"] += 1
-                    KASHPORT_CACHE["error"] = r.get("error") or r.get("body")
-                    if KASHPORT_CACHE["consecutive_errors"] in (3, 10, 30):
-                        log_event("kashport_poll_errors", {
-                            "count": KASHPORT_CACHE["consecutive_errors"],
-                            "error": KASHPORT_CACHE["error"],
-                        })
-            except Exception as e:
-                KASHPORT_CACHE["consecutive_errors"] += 1
-                KASHPORT_CACHE["error"] = str(e)
-        if _kashport_stop.wait(KASHPORT_POLL_INTERVAL):
-            break
+    """2026-05-29 · LEGACY REMOVED · ya no se usa Kashport queue (bypass total).
+    Si por error se llama, exit inmediato."""
+    log_event("kashport_poller_loop_legacy_skipped", {"reason": "vurelo_only_mode"})
+    return
 
 
 def _start_auto_loop():
@@ -1257,9 +1228,9 @@ def _start_auto_loop():
 
 def _auto_loop():
     """
-    Loop que procesa items pending automáticamente.
-    QUEUE_SOURCE = 'vurelo' (default) · usa VURELO_CACHE + api_process_vurelo.
-    QUEUE_SOURCE = 'kashport'         · legacy · usa kashport.pending + api_process.
+    Loop que procesa items pending automáticamente desde Vurelo backend queue.
+    2026-05-29 · LEGACY Kashport polling REMOVIDO · single source = Vurelo backend.
+    Claim atómico en backend previene race entre instances + restart.
     """
     POLL_INTERVAL = 15  # segundos
     while not _auto_stop.is_set():
@@ -1270,43 +1241,25 @@ def _auto_loop():
             continue
 
         try:
-            if QUEUE_SOURCE == "vurelo":
-                # Use VURELO_CACHE fresh o fetch directo
-                items = (VURELO_CACHE.get("data") or {}).get("items") or []
-                if not items:
-                    r = vurelo_queue.pending(limit=100, include_claimed=False)
-                    if r.get("ok"):
-                        items = r.get("items", [])
-                for it in items:
-                    if not AUTO_MODE["enabled"]:
-                        break
-                    tx_id = it.get("tx_id")
-                    if not tx_id or tx_id in PROCESSED_IDS or tx_id in COMPLETED_IDS:
-                        continue
-                    if FAILED_IDS.get(tx_id, 0) >= 1:
-                        continue
-                    log_event("auto_processing_vurelo", {"tx_id": tx_id})
-                    with app.test_request_context():
-                        api_process_vurelo(tx_id)
-            else:
-                # Legacy Kashport
-                if not kashport.configured:
-                    time.sleep(5)
+            items = (VURELO_CACHE.get("data") or {}).get("items") or []
+            if not items:
+                r = vurelo_queue.pending(limit=100, include_claimed=False)
+                if r.get("ok"):
+                    items = r.get("items", [])
+            for it in items:
+                if not AUTO_MODE["enabled"]:
+                    break
+                tx_id = it.get("tx_id")
+                if not tx_id or tx_id in PROCESSED_IDS or tx_id in COMPLETED_IDS:
                     continue
-                q = kashport.pending()
-                if q.get("ok"):
-                    items = q["data"].get("items", [])
-                    for it in items:
-                        if not AUTO_MODE["enabled"]:
-                            break
-                        iid = it.get("id")
-                        if not iid or iid in PROCESSED_IDS or iid in COMPLETED_IDS:
-                            continue
-                        if FAILED_IDS.get(iid, 0) >= 1:
-                            continue
-                        log_event("auto_processing", {"item_id": iid})
-                        with app.test_request_context():
-                            api_process(iid)
+                if FAILED_IDS.get(tx_id, 0) >= 1:
+                    continue
+                # Guard adicional · si backend ya marcó claimed (otra instance) · skip
+                if (it.get("claim") or {}).get("claimed"):
+                    continue
+                log_event("auto_processing_vurelo", {"tx_id": tx_id})
+                with app.test_request_context():
+                    api_process_vurelo(tx_id)
         except Exception as e:
             log_event("auto_error", {"error": str(e)})
 

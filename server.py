@@ -540,13 +540,17 @@ def api_queue():
 @app.route("/api/process/<item_id>", methods=["POST"])
 def api_process(item_id):
     """
-    2026-05-29 · LEGACY DISABLED · Kashport flow eliminado.
-    Usar /api/process-vurelo/<tx_id> (flow nuevo · backend HAv1 queue).
+    2026-05-29 · UI legacy ruta · si item_id es trx_xxx (Vurelo backend) ·
+    forwardea a api_process_vurelo. Si NO empieza con trx_ · legacy 410.
+    Esto mantiene compat con UI viejo sin tocar el template HTML.
     """
+    if item_id and item_id.startswith("trx_"):
+        log_event("api_process_legacy_routed_to_vurelo", {"tx_id": item_id})
+        return api_process_vurelo(item_id)
     return jsonify({
         "ok": False,
         "error": "legacy_kashport_flow_disabled",
-        "message": "Use /api/process-vurelo/<tx_id> · backend Vurelo es source of truth",
+        "message": "Solo trx_xxx aceptado · use /api/process-vurelo/<tx_id>",
     }), 410
 
 

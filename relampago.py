@@ -916,6 +916,30 @@ class RelampagoSession:
         except Exception as e:
             return {"ok": False, "error": "network_error", "message": str(e)}
 
+    def get_ach_transactions(self) -> dict:
+        """Trae transacciones del accountType=Turbo-ACH · estado REAL de las
+        dispersiones ACH (created → approved/rejected). 2026-06-17.
+
+        Shape idéntico a get_trueno_transactions (data.transfers[] con
+        transactionId/state/declinationReason) · por eso alimenta el MISMO
+        store (upsert_trueno_transaction) y el finalize las cierra igual que BReB.
+        El estado 'created' = solo enviado · NO notificar approved/rejected hasta
+        que el state sea final."""
+        if not self.is_logged_in:
+            return {"ok": False, "error": "not_logged_in"}
+        try:
+            with self._lock:
+                r = self._session_ops.get(
+                    f"{API_BASE}/account/transactions",
+                    params={"accountType": "Turbo-ACH"},
+                    timeout=15,
+                )
+            if r.status_code != 200:
+                return {"ok": False, "status": r.status_code, "body": r.text[:300]}
+            return {"ok": True, "data": r.json().get("data", {})}
+        except Exception as e:
+            return {"ok": False, "error": "network_error", "message": str(e)}
+
     def get_bank_codes(self) -> dict:
         try:
             with self._lock:

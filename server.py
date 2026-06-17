@@ -1584,16 +1584,37 @@ def _do_trueno_sync():
         transfers = result["data"].get("transfers", [])
         for t in transfers:
             storage.upsert_trueno_transaction(t)
-        # Cross-reference (detecta rejected_after_sent)
+
+        # ACH state sync (2026-06-17) · Turbo-ACH expone el estado REAL de las
+        # dispersiones ACH (created → approved/rejected) · MISMO shape que Trueno.
+        # Se upsertea al MISMO store · así el finalize cierra ACH igual que BReB
+        # (matchea transactionId == relampago_tx_id) y NO notifica approved/rejected
+        # hasta tener el state final (no el 'created'/enviado). Best-effort · un fallo
+        # del fetch ACH no rompe el sync BReB.
+        ach_count = 0
+        try:
+            ach_result = relampago.get_ach_transactions()
+            if ach_result.get("ok"):
+                ach_transfers = ach_result["data"].get("transfers", [])
+                for t in ach_transfers:
+                    storage.upsert_trueno_transaction(t)
+                ach_count = len(ach_transfers)
+            else:
+                log_event("ach_sync_skip", {"reason": ach_result.get("error") or f"http_{ach_result.get('status')}"})
+        except Exception as e:
+            log_event("ach_sync_error", {"error": str(e)})
+
+        # Cross-reference (detecta rejected_after_sent) · BReB + ACH en un solo store
         new_attns = storage.cross_reference_sent_vs_trueno()
-        # NEW · finalize Kashport para sent_dispersions awaiting + state final detectado
+        # NEW · finalize para sent_dispersions awaiting + state final detectado
         finalized = _finalize_pending_kashport_marks()
         log_event("trueno_sync", {
             "count": len(transfers),
+            "ach_count": ach_count,
             "new_attention": new_attns,
             "kashport_finalized": finalized,
         })
-        return {"ok": True, "count": len(transfers), "new_attention": new_attns, "kashport_finalized": finalized}
+        return {"ok": True, "count": len(transfers), "ach_count": ach_count, "new_attention": new_attns, "kashport_finalized": finalized}
     except Exception as e:
         log_event("trueno_sync_error", {"error": str(e)})
         return {"ok": False, "error": str(e)}

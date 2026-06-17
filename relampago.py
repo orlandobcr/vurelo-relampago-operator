@@ -1031,12 +1031,15 @@ class RelampagoSession:
     # valida llaves BReB) · la validez de la cuenta la responde execute directamente.
     # build_ach_transfer es puro (sin red) · el caller lo pasa a execute_dispersion.
 
-    # Mapeo del account_type Vurelo (CHECKING|SAVINGS) → shape Relampago.
+    # Mapeo del account_type Vurelo (CHECKING|SAVINGS|ELECTRONIC_DEPOSIT) → shape Relampago.
     _ACH_ACCOUNT_TYPE_MAP = {
         "SAVINGS": "savings_account",
         "CHECKING": "checking_account",
+        # Billeteras / depósito electrónico (NEQUI, MOVII, DAVIPLATA, COINK).
+        "ELECTRONIC_DEPOSIT": "electronic_deposit",
         "savings_account": "savings_account",
         "checking_account": "checking_account",
+        "electronic_deposit": "electronic_deposit",
     }
 
     def build_ach_transfer(

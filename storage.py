@@ -116,10 +116,12 @@ def init_db():
             updated_at_iso      TEXT,
             full_json           TEXT,
             last_seen_epoch     REAL,
-            first_seen_epoch    REAL
+            first_seen_epoch    REAL,
+            account_type        TEXT DEFAULT 'Trueno'    -- 'Trueno' (BReB) · 'Turbo-ACH' (ACH) · feed de origen
         );
         CREATE INDEX IF NOT EXISTS idx_trueno_state    ON trueno_transactions(state);
         CREATE INDEX IF NOT EXISTS idx_trueno_routing  ON trueno_transactions(routing);
+        CREATE INDEX IF NOT EXISTS idx_trueno_acctype  ON trueno_transactions(account_type);
         CREATE INDEX IF NOT EXISTS idx_trueno_desc     ON trueno_transactions(description);
         CREATE INDEX IF NOT EXISTS idx_trueno_external ON trueno_transactions(external_id);
 
@@ -142,6 +144,14 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_attn_ack       ON attention_items(acknowledged);
         CREATE INDEX IF NOT EXISTS idx_attn_severity  ON attention_items(severity);
         """)
+
+    # Migración 2026-06-17 · columna account_type en DBs existentes (separa
+    # Trueno=BReB de Turbo-ACH=ACH). Guarded · si ya existe, ignora.
+    with _cursor() as c:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(trueno_transactions)").fetchall()]
+        if "account_type" not in cols:
+            c.execute("ALTER TABLE trueno_transactions ADD COLUMN account_type TEXT DEFAULT 'Trueno'")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_trueno_acctype ON trueno_transactions(account_type)")
 
     # Seed thresholds default si NO existen (no override si el user ya editó)
     with _cursor() as c:
@@ -435,10 +445,11 @@ def update_sent_state(relampago_tx_id: str, new_state: str, declination_reason: 
 
 # ============ trueno_transactions (snapshot from Relampago) ============
 
-def upsert_trueno_transaction(txn: dict):
+def upsert_trueno_transaction(txn: dict, account_type: str = "Trueno"):
     """
     Inserta o actualiza una tx tal como la reportó Relampago.
-    txn · objeto del array /v0/account/transactions?accountType=Trueno
+    txn · objeto del array /v0/account/transactions?accountType=<account_type>
+    account_type · 'Trueno' (BReB) o 'Turbo-ACH' (ACH) · separa las listas en UI.
     """
     tx_id = txn.get("transactionId")
     if not tx_id:
@@ -456,8 +467,8 @@ def upsert_trueno_transaction(txn: dict):
              declination_reason, trx_type, external_provider,
              payee_name, payee_key, payee_bank, payee_doc,
              inserted_at_iso, updated_at_iso, full_json,
-             last_seen_epoch, first_seen_epoch)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             last_seen_epoch, first_seen_epoch, account_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             tx_id,
             txn.get("externalTransactionId"),
@@ -475,22 +486,27 @@ def upsert_trueno_transaction(txn: dict):
             txn.get("inserted_at"),
             txn.get("updated_at"),
             json.dumps(txn, default=str),
-            now, first_seen,
+            now, first_seen, account_type,
         ))
 
 
-def list_trueno_transactions(state: str = None, limit: int = 200) -> list:
+def list_trueno_transactions(state: str = None, limit: int = 200, account_type: str = None) -> list:
+    """account_type · 'Trueno' (BReB) | 'Turbo-ACH' (ACH) | None (todas).
+    El finalize llama con account_type=None (matchea por tx id, agnóstico al rail).
+    La UI separa las listas pasando account_type."""
+    clauses, params = [], []
+    if state:
+        clauses.append("state = ?"); params.append(state)
+    if account_type:
+        # COALESCE · filas legacy sin account_type cuentan como 'Trueno' (BReB)
+        clauses.append("COALESCE(account_type, 'Trueno') = ?"); params.append(account_type)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
     with _cursor() as c:
-        if state:
-            rows = c.execute(
-                "SELECT * FROM trueno_transactions WHERE state = ? ORDER BY inserted_at_iso DESC LIMIT ?",
-                (state, limit),
-            ).fetchall()
-        else:
-            rows = c.execute(
-                "SELECT * FROM trueno_transactions ORDER BY inserted_at_iso DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        rows = c.execute(
+            f"SELECT * FROM trueno_transactions{where} ORDER BY inserted_at_iso DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
         return [dict(r) for r in rows]
 
 

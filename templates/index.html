@@ -71,8 +71,12 @@
         <span class="nav-badge" id="nav-kashport-count">0</span>
       </a>
       <a href="#" class="nav-link" data-view="trueno">
-        <span class="nav-icon">⚡</span><span>Trueno</span>
+        <span class="nav-icon">⚡</span><span>Trueno · BReB</span>
         <span class="nav-badge" id="nav-trueno-count">0</span>
+      </a>
+      <a href="#" class="nav-link" data-view="ach">
+        <span class="nav-icon">🏦</span><span>Turbo-ACH</span>
+        <span class="nav-badge" id="nav-ach-count">0</span>
       </a>
       <a href="#" class="nav-link" data-view="attention">
         <span class="nav-icon">🚨</span><span>Atención</span>
@@ -179,8 +183,25 @@
           <option value="created">created</option>
         </select>
       </h2>
-      <p class="muted small">Snapshot real de /v0/account/transactions?accountType=Trueno · auto-sync 60s.</p>
+      <p class="muted small">Snapshot real de /v0/account/transactions?accountType=Trueno (BReB) · auto-sync 60s.</p>
       <div id="trueno-list" class="big-list">cargando...</div>
+    </section>
+
+    <!-- TURBO-ACH ============================================== -->
+    <section class="subview hidden" data-view="ach">
+      <h2>
+        🏦 Transacciones Turbo-ACH
+        <span id="ach-count" class="badge">0</span>
+        <button id="refresh-ach" class="btn-tiny right">↻ Sync ahora</button>
+        <select id="ach-filter" class="filter-select">
+          <option value="">Todos</option>
+          <option value="approved">approved</option>
+          <option value="rejected">rejected</option>
+          <option value="created">created</option>
+        </select>
+      </h2>
+      <p class="muted small">Snapshot real de /v0/account/transactions?accountType=Turbo-ACH (ACH) · auto-sync 60s.</p>
+      <div id="ach-list" class="big-list">cargando...</div>
     </section>
 
     <!-- ATTENTION ============================================== -->

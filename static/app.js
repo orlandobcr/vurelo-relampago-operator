@@ -63,6 +63,7 @@ function setSubview(name) {
   });
   // Triggers de carga al entrar a la vista
   if (name === "trueno") loadTrueno();
+  if (name === "ach") loadAch();
   if (name === "attention") loadAttention();
   if (name === "logs") loadEvents();
   if (name === "settings") loadSettings();
@@ -418,46 +419,60 @@ async function loadSent() {
   } catch (e) {}
 }
 
-async function loadTrueno() {
-  try {
-    const filter = $("trueno-filter") ? $("trueno-filter").value : "";
-    const url = "/api/trueno" + (filter ? `?state=${filter}` : "");
-    const r = await API(url);
-    const items = r.items || [];
-    const list = $("trueno-list");
-    const counter = $("trueno-count");
-    const nav = $("nav-trueno-count");
-    if (counter) counter.textContent = String(items.length);
-    if (nav) nav.textContent = String(items.length);
-    if (!list) return;
-    if (!items.length) {
-      list.innerHTML = `<div class="muted">Sin transacciones · click "↻ Sync ahora"</div>`;
-      return;
-    }
-    list.innerHTML = items.map(it => {
-      const isFee = (it.trx_type || "").includes("fee");
-      const sc = (it.state || "unknown").toLowerCase();
-      return `
-        <div class="trueno-item ${sc}${isFee ? " fee" : ""}">
-          <div>
-            <div class="sent-name">
-              ${escapeHtml(it.payee_name || "—")}
-              ${it.declination_reason ? `<span style="color:#fca5a5;font-size:11px"> · ${escapeHtml(it.declination_reason)}</span>` : ""}
-            </div>
-            <div class="sent-meta">
-              ${escapeHtml(it.payee_bank || "")} · ${escapeHtml(it.payee_key || "")}
-              · ${escapeHtml(it.external_provider || "")}
-            </div>
-            <div class="trueno-desc">${escapeHtml(it.description || "")} · ${(it.transaction_id || "").slice(0, 20)}</div>
-          </div>
-          <div class="sent-amount" style="color:${(it.amount || 0) < 0 ? '#fca5a5' : '#6ee7b7'}">
-            $ ${fmt(Math.abs(it.amount || 0))}
-          </div>
-          <span class="state-pill ${sc}">${escapeHtml(it.state || "?")}</span>
+function _renderAccountTxRow(it) {
+  const isFee = (it.trx_type || "").includes("fee");
+  const sc = (it.state || "unknown").toLowerCase();
+  return `
+    <div class="trueno-item ${sc}${isFee ? " fee" : ""}">
+      <div>
+        <div class="sent-name">
+          ${escapeHtml(it.payee_name || "—")}
+          ${it.declination_reason ? `<span style="color:#fca5a5;font-size:11px"> · ${escapeHtml(it.declination_reason)}</span>` : ""}
         </div>
-      `;
-    }).join("");
+        <div class="sent-meta">
+          ${escapeHtml(it.payee_bank || "")} · ${escapeHtml(it.payee_key || "")}
+          · ${escapeHtml(it.external_provider || "")}
+        </div>
+        <div class="trueno-desc">${escapeHtml(it.description || "")} · ${(it.transaction_id || "").slice(0, 20)}</div>
+      </div>
+      <div class="sent-amount" style="color:${(it.amount || 0) < 0 ? '#fca5a5' : '#6ee7b7'}">
+        $ ${fmt(Math.abs(it.amount || 0))}
+      </div>
+      <span class="state-pill ${sc}">${escapeHtml(it.state || "?")}</span>
+    </div>
+  `;
+}
+
+// Carga genérica por accountType (Trueno=BReB · Turbo-ACH=ACH) · listas separadas.
+async function _loadAccountTx({ accountType, filterId, listId, countId, navId }) {
+  try {
+    const filter = $(filterId) ? $(filterId).value : "";
+    const qs = new URLSearchParams({ account_type: accountType });
+    if (filter) qs.set("state", filter);
+    const r = await API(`/api/trueno?${qs.toString()}`);
+    const items = r.items || [];
+    if ($(countId)) $(countId).textContent = String(items.length);
+    if ($(navId)) $(navId).textContent = String(items.length);
+    const list = $(listId);
+    if (!list) return;
+    list.innerHTML = items.length
+      ? items.map(_renderAccountTxRow).join("")
+      : `<div class="muted">Sin transacciones · click "↻ Sync ahora"</div>`;
   } catch (e) {}
+}
+
+function loadTrueno() {
+  return _loadAccountTx({
+    accountType: "Trueno", filterId: "trueno-filter",
+    listId: "trueno-list", countId: "trueno-count", navId: "nav-trueno-count",
+  });
+}
+
+function loadAch() {
+  return _loadAccountTx({
+    accountType: "Turbo-ACH", filterId: "ach-filter",
+    listId: "ach-list", countId: "ach-count", navId: "nav-ach-count",
+  });
 }
 
 async function loadAttention() {
@@ -640,6 +655,7 @@ async function doSyncTrueno(btn) {
   if (btn) { btn.disabled = true; const old = btn.textContent; btn.textContent = "⟳ syncing..."; }
   await API("/api/sync-trueno", { method: "POST" });
   await loadTrueno();
+  await loadAch();
   await loadAttention();
   await loadStats();
   if (btn) { btn.disabled = false; btn.textContent = "↻ Sync ahora"; }
@@ -669,6 +685,7 @@ document.addEventListener("DOMContentLoaded", () => {
   wire("refresh-queue", loadQueue);
   wire("refresh-sent", loadSent);
   wire("refresh-trueno", () => doSyncTrueno($("refresh-trueno")));
+  wire("refresh-ach", () => doSyncTrueno($("refresh-ach")));
   wire("sync-trueno-btn", () => doSyncTrueno($("sync-trueno-btn")));
   wire("manual-refresh-session", async () => {
     const r = await API("/api/refresh", { method: "POST" });
@@ -680,6 +697,8 @@ document.addEventListener("DOMContentLoaded", () => {
   // Trueno filter
   const tf = $("trueno-filter");
   if (tf) tf.addEventListener("change", loadTrueno);
+  const af = $("ach-filter");
+  if (af) af.addEventListener("change", loadAch);
 
   // Auto toggle
   const auto = $("auto-toggle");

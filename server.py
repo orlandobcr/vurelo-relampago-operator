@@ -1322,9 +1322,14 @@ def api_sent():
 
 @app.route("/api/trueno")
 def api_trueno():
-    """Última snapshot de transacciones Trueno (sync background cada 60s)."""
+    """Snapshot de transacciones por accountType (sync background cada 60s).
+    ?account_type=Trueno (BReB · default vista Trueno) | Turbo-ACH (ACH).
+    Sin account_type · devuelve todas (compat)."""
     state_filter = request.args.get("state")
-    return jsonify({"items": storage.list_trueno_transactions(state=state_filter, limit=200)})
+    account_type = request.args.get("account_type")
+    return jsonify({"items": storage.list_trueno_transactions(
+        state=state_filter, limit=200, account_type=account_type,
+    )})
 
 
 @app.route("/api/attention")
@@ -1597,7 +1602,7 @@ def _do_trueno_sync():
             if ach_result.get("ok"):
                 ach_transfers = ach_result["data"].get("transfers", [])
                 for t in ach_transfers:
-                    storage.upsert_trueno_transaction(t)
+                    storage.upsert_trueno_transaction(t, account_type="Turbo-ACH")
                 ach_count = len(ach_transfers)
             else:
                 log_event("ach_sync_skip", {"reason": ach_result.get("error") or f"http_{ach_result.get('status')}"})

@@ -47,7 +47,21 @@ relampago = RelampagoSession()
 kashport = KashportClient()
 
 # State global · modo auto · processed/skipped
-AUTO_MODE = {"enabled": False}
+# AUTO_MODE separado por rail (2026-06-16) · BReB y ACH independientes.
+# `enabled` = OR de ambos (compat con lecturas legacy en todo el archivo).
+# Si el rail está en MANUAL (False), el operador aprueba cada item de ese rail
+# desde el web app (POST /api/process-vurelo/<tx_id>) · el auto-loop lo salta.
+AUTO_MODE = {"enabled": False, "breb": False, "ach": False}
+
+
+def _auto_sync_enabled() -> None:
+    """Mantiene AUTO_MODE['enabled'] = OR(breb, ach) tras cualquier cambio."""
+    AUTO_MODE["enabled"] = bool(AUTO_MODE.get("breb") or AUTO_MODE.get("ach"))
+
+
+def _auto_for(kind) -> bool:
+    """True si el auto-mode del rail (BREB|ACH) está encendido."""
+    return bool(AUTO_MODE.get((kind or "breb").lower(), False))
 PROCESSED_IDS = set()        # items que ya iniciamos a procesar (submit-once persistido in-memory)
 COMPLETED_IDS = set()        # mark-paid OK
 FAILED_IDS = {}              # id → attempts
@@ -225,6 +239,8 @@ def api_status():
         "relampago": relampago.status,
         "kashport_configured": kashport.configured,
         "auto_mode": AUTO_MODE["enabled"],
+        "auto_mode_breb": AUTO_MODE["breb"],
+        "auto_mode_ach": AUTO_MODE["ach"],
         "processed_count": len(PROCESSED_IDS),
         "completed_count": len(COMPLETED_IDS),
         "failed_count": len(FAILED_IDS),
@@ -535,19 +551,37 @@ def _vurelo_item_to_ui_shape(v: dict) -> dict:
     nuevos campos del flow Vurelo.
     """
     dest = v.get("destination") or {}
+    ach = v.get("ach") or {}
     claim = v.get("claim") or {}
+    kind = (v.get("kind") or "BREB").upper()
+
+    if kind == "ACH":
+        # Destino bancario · key_value=None · account_number poblado para el render
+        ui_dest = {
+            "account_number": ach.get("account_number"),
+            "bank_code": ach.get("bank_code"),
+            "account_type": ach.get("account_type"),
+            "fullname": ach.get("holder_name") or v.get("description"),
+            "doc_type": ach.get("holder_doc_type"),
+            "doc_number": ach.get("holder_doc_number"),
+        }
+    else:
+        ui_dest = {
+            "key_value": dest.get("breb_key"),
+            "key_type": dest.get("breb_key_type"),
+            "fullname": v.get("description"),
+        }
+
     return {
         # UI legacy fields (compat)
         "id": v.get("tx_id", ""),
         "amount_cop": v.get("amount_cop_pesos", 0),
         "amount": v.get("amount_cop_pesos", 0),
-        "rail": "breb",
+        "rail": "ach" if kind == "ACH" else "breb",
+        "kind": kind,                              # BREB | ACH · UI badge
+        "ach": ach if kind == "ACH" else None,     # bloque crudo (audit/UI)
         "oldvprovider_id": v.get("external_id"),  # = "fast_pay:trx_xxx"
-        "destination": {
-            "key_value": dest.get("breb_key"),
-            "key_type": dest.get("breb_key_type"),
-            "fullname": v.get("description"),
-        },
+        "destination": ui_dest,
         # New Vurelo fields
         "tx_id": v.get("tx_id"),
         "external_id": v.get("external_id"),
@@ -919,18 +953,33 @@ def api_process_vurelo(tx_id):
     PROCESSED_IDS.add(tx_id)
     log_event("vurelo_process_start", {"tx_id": tx_id})
 
-    # 3 · Extract dispatch data
+    # 3 · Extract dispatch data · BReB (llave) o ACH (cuenta bancaria) según kind
     dest = item.get("destination") or {}
-    key = dest.get("breb_key")
+    ach = item.get("ach") or {}
+    kind = (item.get("kind") or "BREB").upper()
     amount_cop_pesos = item.get("amount_cop_pesos") or 0
     virtual_amount_cents = item.get("amount_cop_centavos") or int(round(float(amount_cop_pesos) * 100))
-    routing = "breb"
+    routing = "ach" if kind == "ACH" else "breb"
 
-    if not key or amount_cop_pesos <= 0:
-        # Release claim + error
-        vurelo_queue.release_claim(tx_id, reason="missing_key_or_amount")
-        PROCESSED_IDS.discard(tx_id)
-        return jsonify({"ok": False, "error": "invalid_item_data", "tx": item})
+    if kind == "ACH":
+        # key = número de cuenta · usado para rules/dup-check + logging
+        key = ach.get("account_number")
+        ach_ok = all([
+            ach.get("account_number"), ach.get("bank_code"),
+            ach.get("account_type"), ach.get("holder_doc_number"),
+            ach.get("holder_name"),
+        ])
+        if not ach_ok or amount_cop_pesos <= 0:
+            vurelo_queue.release_claim(tx_id, reason="missing_ach_fields_or_amount")
+            PROCESSED_IDS.discard(tx_id)
+            return jsonify({"ok": False, "error": "invalid_ach_item_data", "tx": item})
+    else:
+        key = dest.get("breb_key")
+        if not key or amount_cop_pesos <= 0:
+            # Release claim + error
+            vurelo_queue.release_claim(tx_id, reason="missing_key_or_amount")
+            PROCESSED_IDS.discard(tx_id)
+            return jsonify({"ok": False, "error": "invalid_item_data", "tx": item})
 
     # 4 · Anti-duplicado / gap check
     rules_check = storage.check_dispersion_rules(key, int(amount_cop_pesos))
@@ -946,61 +995,76 @@ def api_process_vurelo(tx_id):
             "wait_seconds": rules_check.get("wait_seconds"),
         })
 
-    # 5 · Validate llave · resolve_payee
-    resolve = relampago.resolve_payee(key, virtual_amount_cents, routing=routing)
-    if resolve.get("status") == 404:
-        # Llave inválida · notify webhook rejected · release no necesario (vamos a rejected definitivo)
-        try:
-            wh = vurelo_webhook.notify_finalize(
-                external_id=tx_id,                # backend strategy 0 · findById(trx_xxx)
-                state="rejected",
-                relampago_tx_id="",
-                kashport_item_id=None,
-                kashport_provider_id=item.get("cobre_payment_id"),
-                amount_cop=int(amount_cop_pesos),
-                reason="payee_key_invalid",
-                detail=f"Llave BREB no encontrada · validado vía Relampago API · key={key}",
-            )
-            log_event("vurelo_payee_invalid_notified", {"tx_id": tx_id, "wh": wh})
-        except Exception as e:
-            log_event("vurelo_notify_exception", {"tx_id": tx_id, "error": str(e)})
-        try:
-            storage.add_attention(
-                kind="vurelo_payee_invalid",
-                severity="warn",
-                relampago_tx_id=None,
-                external_id=tx_id,
-                kashport_provider_id=item.get("cobre_payment_id"),
-                payee_name=item.get("description"),
-                amount_cop=int(amount_cop_pesos),
-                description=f"Llave BREB inválida · {key} · monto ${int(amount_cop_pesos):,.0f} · tx {tx_id}",
-                detail_json={"tx_id": tx_id, "key_tried": key, "resolve": resolve.get("data")},
-            )
-        except Exception:
-            pass
-        COMPLETED_IDS.add(tx_id)
-        return jsonify({
-            "ok": False,
-            "auto_rejected": True,
-            "tx_id": tx_id,
-            "key": key,
-            "message": "Llave inválida · backend marca rejected + libera hold",
-        })
-    if not resolve.get("ok"):
-        vurelo_queue.release_claim(tx_id, reason=f"resolve_failed:{resolve.get('status')}")
-        FAILED_IDS[tx_id] = FAILED_IDS.get(tx_id, 0) + 1
-        PROCESSED_IDS.discard(tx_id)
-        return jsonify({"ok": False, "error": "resolve_failed", "detail": resolve})
+    # 5+6 · Construir el transfer validado
+    #   · BReB → resolve-payee (valida la llave · 404 = auto-reject + refund)
+    #   · ACH  → build directo (resolve-payee es solo para llaves BReB) · execute
+    #            valida la cuenta. Shape espejado de la ejecución real del portal.
+    if kind == "ACH":
+        validated = relampago.build_ach_transfer(
+            account_number=ach.get("account_number"),
+            bank_code=ach.get("bank_code"),
+            account_type=ach.get("account_type"),
+            document_type=ach.get("holder_doc_type") or "CC",
+            document_number=ach.get("holder_doc_number"),
+            name=ach.get("holder_name"),
+            amount_cents=virtual_amount_cents,
+        )
+    else:
+        # 5 · Validate llave · resolve_payee
+        resolve = relampago.resolve_payee(key, virtual_amount_cents, routing=routing)
+        if resolve.get("status") == 404:
+            # Llave inválida · notify webhook rejected · release no necesario (vamos a rejected definitivo)
+            try:
+                wh = vurelo_webhook.notify_finalize(
+                    external_id=tx_id,                # backend strategy 0 · findById(trx_xxx)
+                    state="rejected",
+                    relampago_tx_id="",
+                    kashport_item_id=None,
+                    kashport_provider_id=item.get("cobre_payment_id"),
+                    amount_cop=int(amount_cop_pesos),
+                    reason="payee_key_invalid",
+                    detail=f"Llave BREB no encontrada · validado vía Relampago API · key={key}",
+                )
+                log_event("vurelo_payee_invalid_notified", {"tx_id": tx_id, "wh": wh})
+            except Exception as e:
+                log_event("vurelo_notify_exception", {"tx_id": tx_id, "error": str(e)})
+            try:
+                storage.add_attention(
+                    kind="vurelo_payee_invalid",
+                    severity="warn",
+                    relampago_tx_id=None,
+                    external_id=tx_id,
+                    kashport_provider_id=item.get("cobre_payment_id"),
+                    payee_name=item.get("description"),
+                    amount_cop=int(amount_cop_pesos),
+                    description=f"Llave BREB inválida · {key} · monto ${int(amount_cop_pesos):,.0f} · tx {tx_id}",
+                    detail_json={"tx_id": tx_id, "key_tried": key, "resolve": resolve.get("data")},
+                )
+            except Exception:
+                pass
+            COMPLETED_IDS.add(tx_id)
+            return jsonify({
+                "ok": False,
+                "auto_rejected": True,
+                "tx_id": tx_id,
+                "key": key,
+                "message": "Llave inválida · backend marca rejected + libera hold",
+            })
+        if not resolve.get("ok"):
+            vurelo_queue.release_claim(tx_id, reason=f"resolve_failed:{resolve.get('status')}")
+            FAILED_IDS[tx_id] = FAILED_IDS.get(tx_id, 0) + 1
+            PROCESSED_IDS.discard(tx_id)
+            return jsonify({"ok": False, "error": "resolve_failed", "detail": resolve})
 
-    # 6 · Execute dispersión
-    resolve_data = resolve.get("data", {}).get("data", {})
-    validated_transfers = resolve_data.get("transfers", [])
-    if not validated_transfers:
-        vurelo_queue.release_claim(tx_id, reason="no_validated_transfer")
-        PROCESSED_IDS.discard(tx_id)
-        return jsonify({"ok": False, "error": "no_validated_transfer"})
+        # 6 · Execute dispersión
+        resolve_data = resolve.get("data", {}).get("data", {})
+        validated_transfers = resolve_data.get("transfers", [])
+        if not validated_transfers:
+            vurelo_queue.release_claim(tx_id, reason="no_validated_transfer")
+            PROCESSED_IDS.discard(tx_id)
+            return jsonify({"ok": False, "error": "no_validated_transfer"})
 
-    validated = validated_transfers[0]
+        validated = validated_transfers[0]
     # Description + reference · usar tx_id Vurelo (canonical) + external_id legacy
     validated["description"] = item.get("external_id") or tx_id
     validated["reference"] = item.get("external_id") or tx_id
@@ -1290,25 +1354,52 @@ def api_sync_trueno():
 
 @app.route("/api/auto", methods=["POST"])
 def api_auto_toggle():
+    """Toggle auto-mode · SEPARADO por rail (2026-06-16).
+
+    Body:
+      {"rail": "breb"|"ach"|"all", "enabled": bool}
+      {"enabled": bool}                  · legacy · aplica a AMBOS rails (= "all")
+
+    MANUAL (enabled=False) → el operador aprueba ese rail desde el web app.
+    """
     body = request.get_json(force=True, silent=True) or {}
     enabled = bool(body.get("enabled"))
-    AUTO_MODE["enabled"] = enabled
-    # Persistir en app_settings para sobrevivir restart del service
-    storage.set_setting("auto_mode", "1" if enabled else "0")
-    log_event("auto_mode_changed", {"enabled": enabled, "persisted": True})
-    if enabled:
+    rail = str(body.get("rail") or "all").lower()
+    if rail not in ("breb", "ach", "all"):
+        return jsonify({"ok": False, "error": f"rail inválido · {rail}"}), 400
+
+    targets = ["breb", "ach"] if rail == "all" else [rail]
+    for t in targets:
+        AUTO_MODE[t] = enabled
+        storage.set_setting(f"auto_mode_{t}", "1" if enabled else "0")
+    _auto_sync_enabled()
+    # Compat · mantener el setting legacy `auto_mode` = OR de ambos
+    storage.set_setting("auto_mode", "1" if AUTO_MODE["enabled"] else "0")
+    log_event("auto_mode_changed", {
+        "rail": rail, "enabled": enabled,
+        "breb": AUTO_MODE["breb"], "ach": AUTO_MODE["ach"], "persisted": True,
+    })
+
+    if AUTO_MODE["enabled"]:
+        # Al menos un rail en auto · arrancar loop (el loop filtra por rail)
         _start_auto_loop()
-        # Vurelo poller arranca siempre (independiente · UI lo necesita)
         if QUEUE_SOURCE == "vurelo" and vurelo_queue.is_configured():
             _start_vurelo_poller()
         elif QUEUE_SOURCE == "kashport":
             _start_kashport_poller()
     else:
+        # Ambos rails en manual · parar auto loop (vurelo poller sigue para UI)
         _auto_stop.set()
-        # Solo paramos auto loop · vurelo poller sigue alimentando UI
         if QUEUE_SOURCE == "kashport":
             _kashport_stop.set()
-    return jsonify({"ok": True, "enabled": enabled, "persisted": True})
+    return jsonify({
+        "ok": True,
+        "rail": rail,
+        "enabled": enabled,
+        "auto_mode_breb": AUTO_MODE["breb"],
+        "auto_mode_ach": AUTO_MODE["ach"],
+        "persisted": True,
+    })
 
 
 @app.route("/api/events")
@@ -1458,7 +1549,12 @@ def _auto_loop():
                 # Guard adicional · si backend ya marcó claimed (otra instance) · skip
                 if (it.get("claim") or {}).get("claimed"):
                     continue
-                log_event("auto_processing_vurelo", {"tx_id": tx_id})
+                # Auto SEPARADO por rail · si el rail (BREB|ACH) está en MANUAL,
+                # NO auto-procesar · queda pending para aprobación del operador.
+                it_kind = it.get("kind") or "BREB"
+                if not _auto_for(it_kind):
+                    continue
+                log_event("auto_processing_vurelo", {"tx_id": tx_id, "kind": it_kind})
                 with app.test_request_context():
                     api_process_vurelo(tx_id)
         except Exception as e:
@@ -1804,19 +1900,30 @@ def _startup(args):
     else:
         print("· RELAMPAGO_AUTO_LOGIN_ENABLED=0 · solo login manual via UI")
 
-    # 3. Resolver auto_mode (CLI flag > DB > default manual)
+    # 3. Resolver auto_mode SEPARADO por rail (CLI flag > DB > default manual)
+    #    CLI --auto/--manual aplican a AMBOS rails. Sin flag · lee por rail de DB:
+    #    breb default = setting legacy `auto_mode` (migración) · ach default = manual.
     if args.auto:
-        AUTO_MODE["enabled"] = True
-        storage.set_setting("auto_mode", "1")
-        print("▶ AUTO mode FORZADO por CLI flag --auto")
+        AUTO_MODE["breb"] = AUTO_MODE["ach"] = True
+        storage.set_setting("auto_mode_breb", "1")
+        storage.set_setting("auto_mode_ach", "1")
+        print("▶ AUTO mode FORZADO por CLI flag --auto (breb + ach)")
     elif args.manual:
-        AUTO_MODE["enabled"] = False
-        storage.set_setting("auto_mode", "0")
-        print("· MANUAL mode FORZADO por CLI flag --manual")
+        AUTO_MODE["breb"] = AUTO_MODE["ach"] = False
+        storage.set_setting("auto_mode_breb", "0")
+        storage.set_setting("auto_mode_ach", "0")
+        print("· MANUAL mode FORZADO por CLI flag --manual (breb + ach)")
     else:
-        saved = storage.get_setting("auto_mode", "0")
-        AUTO_MODE["enabled"] = saved == "1"
-        print(f"· Modo restaurado de SQLite · {'AUTO' if AUTO_MODE['enabled'] else 'MANUAL'}")
+        legacy = storage.get_setting("auto_mode", "0")  # migración mono-flag → breb
+        AUTO_MODE["breb"] = storage.get_setting("auto_mode_breb", legacy) == "1"
+        AUTO_MODE["ach"] = storage.get_setting("auto_mode_ach", "0") == "1"
+        print(
+            f"· Modo restaurado de SQLite · BReB={'AUTO' if AUTO_MODE['breb'] else 'MANUAL'}"
+            f" · ACH={'AUTO' if AUTO_MODE['ach'] else 'MANUAL'}"
+        )
+    _auto_sync_enabled()
+    # Compat · setting legacy `auto_mode` = OR de ambos
+    storage.set_setting("auto_mode", "1" if AUTO_MODE["enabled"] else "0")
 
     # 4. Arrancar Vurelo backend poller SIEMPRE (UI necesita queue independiente
     # del auto_mode · single source of truth = Vurelo backend HAv1).

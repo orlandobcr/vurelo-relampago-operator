@@ -162,9 +162,23 @@ async function loadStatus() {
     STATE.sessionWasAlive = !!r.logged_in;
     setStatusDot(r.logged_in, r.email, r.token_expires_in_seconds, r.refresh_count);
     STATE.autoMode = s.auto_mode;
+    STATE.autoModeBreb = s.auto_mode_breb;
+    STATE.autoModeAch = s.auto_mode_ach;
+    // Toggle legacy combinado (compat · refleja OR)
     if ($("auto-toggle")) {
       $("auto-toggle").checked = s.auto_mode;
       $("auto-label").textContent = s.auto_mode ? "AUTO 🟢" : "MANUAL";
+    }
+    // Toggles separados por rail (BReB / ACH)
+    if ($("auto-toggle-breb")) {
+      $("auto-toggle-breb").checked = !!s.auto_mode_breb;
+      if ($("auto-label-breb"))
+        $("auto-label-breb").textContent = s.auto_mode_breb ? "AUTO 🟢" : "MANUAL ✋";
+    }
+    if ($("auto-toggle-ach")) {
+      $("auto-toggle-ach").checked = !!s.auto_mode_ach;
+      if ($("auto-label-ach"))
+        $("auto-label-ach").textContent = s.auto_mode_ach ? "AUTO 🟢" : "MANUAL ✋";
     }
 
     // Banner · service pausado si Google está OK pero Relampago session muerta
@@ -286,6 +300,12 @@ function renderQueueItem(it) {
   else if (STATE.failed.has(it.id)) { cls = "failed"; lbl = "✗"; }
   const d = it.destination || {};
   const key = d.key_value || d.account_number || "—";
+  const kind = (it.kind || (it.rail === "ach" ? "ACH" : "BREB")).toUpperCase();
+  const kindBadge = `<span class="kind-badge kind-${kind.toLowerCase()}">${kind === "ACH" ? "ACH 🏦" : "BReB ⚡"}</span>`;
+  // Para ACH mostramos banco · para BReB la llave
+  const destLine = kind === "ACH"
+    ? `Banco ${escapeHtml(d.bank_code || "?")} · Cta ${escapeHtml(key)} (${escapeHtml((d.account_type || "").toLowerCase())})`
+    : escapeHtml(key);
 
   // Rule check · si bloqueado · botón disabled + razón
   const rc = it.rule_check || { ok: true };
@@ -300,9 +320,9 @@ function renderQueueItem(it) {
   return `
     <div class="queue-item ${cls} ${blocked ? 'rule-blocked' : ''}" data-id="${escapeHtml(it.id)}">
       <div class="qi-info">
-        <div class="qi-name">${escapeHtml(d.fullname || "—")} ${lbl}</div>
+        <div class="qi-name">${kindBadge} ${escapeHtml(d.fullname || "—")} ${lbl}</div>
         <div class="qi-meta">
-          ${(it.rail || "").toUpperCase()} · ${escapeHtml(key)}
+          ${destLine}
           · ${escapeHtml(d.doc_type || "CC")} ${escapeHtml(d.doc_number || "")}
         </div>
         ${blockTxt}
@@ -671,7 +691,26 @@ document.addEventListener("DOMContentLoaded", () => {
     await API("/api/auto", { method: "POST", body: JSON.stringify({ enabled }) });
     STATE.autoMode = enabled;
     $("auto-label").textContent = enabled ? "AUTO 🟢" : "MANUAL";
+    await loadStatus();  // refresca toggles por rail (legacy = ambos)
   });
+
+  // Auto toggles SEPARADOS por rail (BReB / ACH) · servicio procesa el rail en
+  // AUTO sin UI · MANUAL = el operador aprueba cada item desde la cola.
+  function wireRailToggle(elId, labelId, rail) {
+    const t = $(elId);
+    if (!t) return;
+    t.addEventListener("change", async (e) => {
+      const enabled = e.target.checked;
+      if (enabled && !confirm(`AUTO ${rail.toUpperCase()} procesará TODOS los pending de ese rail sin click. ¿Continuar?`)) {
+        e.target.checked = false; return;
+      }
+      await API("/api/auto", { method: "POST", body: JSON.stringify({ rail, enabled }) });
+      if ($(labelId)) $(labelId).textContent = enabled ? "AUTO 🟢" : "MANUAL ✋";
+      await loadStatus();
+    });
+  }
+  wireRailToggle("auto-toggle-breb", "auto-label-breb", "breb");
+  wireRailToggle("auto-toggle-ach", "auto-label-ach", "ach");
 
   // Kashport save
   const ks = $("kashport-save");

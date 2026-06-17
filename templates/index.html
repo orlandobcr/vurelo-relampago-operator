@@ -114,15 +114,32 @@
         </div>
 
         <div class="card mini">
-          <h3>Modo</h3>
+          <h3>Modo · auto por rail</h3>
           <div class="row">
+            <span class="kind-badge kind-breb">BReB ⚡</span>
             <label class="switch">
-              <input id="auto-toggle" type="checkbox">
+              <input id="auto-toggle-breb" type="checkbox">
               <span class="slider"></span>
             </label>
-            <span id="auto-label">MANUAL</span>
+            <span id="auto-label-breb">MANUAL ✋</span>
           </div>
-          <p class="muted small" id="auto-help">click "▶ Procesar" item por item</p>
+          <div class="row">
+            <span class="kind-badge kind-ach">ACH 🏦</span>
+            <label class="switch">
+              <input id="auto-toggle-ach" type="checkbox">
+              <span class="slider"></span>
+            </label>
+            <span id="auto-label-ach">MANUAL ✋</span>
+          </div>
+          <p class="muted small" id="auto-help">
+            AUTO = el servicio procesa ese rail solo (sin UI) · MANUAL = apruebas
+            cada item con "▶ Procesar". Independiente por rail.
+          </p>
+          <!-- Toggle legacy combinado (oculto · compat retro) -->
+          <label class="switch" style="display:none">
+            <input id="auto-toggle" type="checkbox"><span class="slider"></span>
+          </label>
+          <span id="auto-label" style="display:none">MANUAL</span>
         </div>
       </div>
 

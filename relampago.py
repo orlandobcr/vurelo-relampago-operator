@@ -995,3 +995,64 @@ class RelampagoSession:
             }
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    # ============ ACH dispersion (2026-06-16) ============
+    #
+    # ACH usa el MISMO endpoint /transactions/execute que BReB · solo cambia
+    # routing="ach" y el bloque payee.bank_account lleva cuenta bancaria completa
+    # (type+bank_code+number) en vez de solo la llave. Shape verificado contra una
+    # ejecución real del portal (POST /v0/transactions/execute · 201 Created).
+    #
+    # A diferencia de BReB, ACH NO pre-valida vía /resolve-payee (ese endpoint
+    # valida llaves BReB) · la validez de la cuenta la responde execute directamente.
+    # build_ach_transfer es puro (sin red) · el caller lo pasa a execute_dispersion.
+
+    # Mapeo del account_type Vurelo (CHECKING|SAVINGS) → shape Relampago.
+    _ACH_ACCOUNT_TYPE_MAP = {
+        "SAVINGS": "savings_account",
+        "CHECKING": "checking_account",
+        "savings_account": "savings_account",
+        "checking_account": "checking_account",
+    }
+
+    def build_ach_transfer(
+        self,
+        *,
+        account_number: str,
+        bank_code: str,
+        account_type: str,
+        document_type: str,
+        document_number: str,
+        name: str,
+        amount_cents: int,
+        bank_name: str = "",
+        description: str = "",
+        reference: str = "",
+        emails_to_notify: list | None = None,
+    ) -> dict:
+        """Construye un transfer ACH para execute_dispersion. Puro · sin red.
+
+        amount_cents · virtualAmount en CENTAVOS COP (= pesos × 100).
+        account_type · acepta 'SAVINGS'/'CHECKING' (Vurelo) o '*_account' (Relampago).
+        """
+        rel_type = self._ACH_ACCOUNT_TYPE_MAP.get(
+            (account_type or "").strip(), "savings_account"
+        )
+        return {
+            "virtualAmount": int(amount_cents),
+            "payee": {
+                "bank_account": {
+                    "type": rel_type,
+                    "bank_code": str(bank_code or ""),
+                    "bank_name": str(bank_name or ""),
+                    "number": str(account_number or ""),
+                },
+                "document_type": str(document_type or ""),
+                "document_number": str(document_number or ""),
+                "name": str(name or ""),
+            },
+            "routing": "ach",
+            "description": description or "",
+            "emails_to_notify": emails_to_notify or [],
+            "reference": reference or "",
+        }

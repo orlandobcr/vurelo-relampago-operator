@@ -121,7 +121,8 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_trueno_state    ON trueno_transactions(state);
         CREATE INDEX IF NOT EXISTS idx_trueno_routing  ON trueno_transactions(routing);
-        CREATE INDEX IF NOT EXISTS idx_trueno_acctype  ON trueno_transactions(account_type);
+        -- idx_trueno_acctype se crea en la migración (después del ALTER) · NO acá:
+        -- en DBs existentes la columna account_type aún no existe en este punto.
         CREATE INDEX IF NOT EXISTS idx_trueno_desc     ON trueno_transactions(description);
         CREATE INDEX IF NOT EXISTS idx_trueno_external ON trueno_transactions(external_id);
 
@@ -151,7 +152,9 @@ def init_db():
         cols = [r[1] for r in c.execute("PRAGMA table_info(trueno_transactions)").fetchall()]
         if "account_type" not in cols:
             c.execute("ALTER TABLE trueno_transactions ADD COLUMN account_type TEXT DEFAULT 'Trueno'")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trueno_acctype ON trueno_transactions(account_type)")
+        # Índice creado SIEMPRE (idempotente) · ya sea DB fresca o migrada · aquí la
+        # columna ya existe garantizado (CREATE TABLE nueva o ALTER de arriba).
+        c.execute("CREATE INDEX IF NOT EXISTS idx_trueno_acctype ON trueno_transactions(account_type)")
 
     # Seed thresholds default si NO existen (no override si el user ya editó)
     with _cursor() as c:

@@ -13,6 +13,7 @@ Uso:
 UI: http://localhost:8787
 """
 import argparse
+import ipaddress
 import json
 import os
 import signal
@@ -40,7 +41,34 @@ storage.init_db()
 
 @app.before_request
 def _auth_gate():
+    # /internal/* · sin Google ni llave · sólo red interna (ver _internal_gate)
+    if request.path.startswith("/internal/"):
+        return _internal_gate()
     return gauth.require_auth()
+
+
+# ============ Red interna · /internal/* ============
+# Lo consultan las instancias del backend directo al puerto del contenedor
+# (worker1:3001), nunca por relampago.vurelo.co. Todo lo que pase por el nginx
+# de borde llega con su IP o con cabeceras de proxy → 403.
+RELAMPAGO_EDGE_PROXY_IPS = {
+    ip.strip()
+    for ip in os.environ.get("RELAMPAGO_EDGE_PROXY_IPS", "192.168.200.9").split(",")
+    if ip.strip()
+}
+_PROXY_HEADERS = ("X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "Forwarded")
+
+
+def _internal_gate():
+    remote = request.remote_addr or ""
+    try:
+        privada = ipaddress.ip_address(remote).is_private
+    except ValueError:
+        privada = False
+    via_proxy = any(request.headers.get(h) for h in _PROXY_HEADERS)
+    if not privada or via_proxy or remote in RELAMPAGO_EDGE_PROXY_IPS:
+        return jsonify({"error": "forbidden", "message": "sólo red interna"}), 403
+    return None
 
 # Singleton de sesión Relampago + Kashport client
 relampago = RelampagoSession()
@@ -384,9 +412,64 @@ def api_refresh():
     return jsonify(result)
 
 
+INTERNAL_BALANCE_MAX_AGE = int(os.environ.get("RELAMPAGO_INTERNAL_BALANCE_MAX_AGE", "30"))
+BALANCE_CACHE = {"data": None, "fetched_epoch": None, "last_error": None, "last_error_epoch": None}
+_balance_cache_lock = threading.Lock()
+
+
+def _fetch_balance() -> dict:
+    """Consulta Relampago y deja la última lectura buena en BALANCE_CACHE."""
+    result = relampago.get_balance()
+    with _balance_cache_lock:
+        if result.get("ok"):
+            BALANCE_CACHE["data"] = result["data"]
+            BALANCE_CACHE["fetched_epoch"] = time.time()
+        else:
+            BALANCE_CACHE["last_error"] = result.get("error")
+            BALANCE_CACHE["last_error_epoch"] = time.time()
+    return result
+
+
+def _iso_utc(epoch):
+    if epoch is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+@app.route("/internal/balance")
+def internal_balance():
+    """Saldos de Relampago para el backend (red interna, sin auth).
+
+    `updated_at` = última lectura BUENA. Si la consulta en vivo falla se
+    devuelve esa última lectura con `stale: true` y el error."""
+    with _balance_cache_lock:
+        fetched = BALANCE_CACHE["fetched_epoch"]
+    fresh = fetched is not None and time.time() - fetched <= INTERNAL_BALANCE_MAX_AGE
+    live_error = None
+    if not fresh:
+        r = _fetch_balance()
+        if not r.get("ok"):
+            live_error = r.get("error")
+    with _balance_cache_lock:
+        data = BALANCE_CACHE["data"]
+        fetched = BALANCE_CACHE["fetched_epoch"]
+    age = None if fetched is None else int(time.time() - fetched)
+    stale = data is None or age > INTERNAL_BALANCE_MAX_AGE
+    body = {
+        "ok": data is not None,
+        "accounts": (data or {}).get("accounts", []),
+        "updated_at": _iso_utc(fetched),
+        "age_seconds": age,
+        "stale": stale,
+        "session_logged_in": relampago.is_logged_in,
+        "error": live_error,
+    }
+    return jsonify(body), (200 if data is not None else 503)
+
+
 @app.route("/api/balance")
 def api_balance():
-    result = relampago.get_balance()
+    result = _fetch_balance()
     # Check thresholds y disparar alertas si aplica (only-one logic)
     if result.get("ok"):
         try:

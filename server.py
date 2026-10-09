@@ -467,6 +467,112 @@ def internal_balance():
     return jsonify(body), (200 if data is not None else 503)
 
 
+# ── Movimientos · mismo contrato que /internal/balance ──────────────────────
+#
+# El saldo solo dice CUÁNTO hay, no QUÉ pasó. Para conciliar un cierre de pool
+# contra lo que de verdad se movió hace falta el listado, y este servicio ya lo
+# tiene: `relampago.get_trueno_transactions()` y `get_ach_transactions()` lo
+# traen desde 2026-05-23 y 2026-06-17, pero solo los usaba el sync interno.
+#
+# Por qué importa tenerlo del lado del backend: el monitor de saldo lee cada 15
+# minutos y el detector de saltos compara lecturas CONSECUTIVAS. Una plata que
+# entra y sale dentro de esa ventana deja delta ~0 y no aparece como salto: el
+# movimiento existió y el cuadre no lo ve. Con el listado eso deja de depender
+# de la suerte del muestreo.
+#
+# `accountType` va contra una lista blanca · lo que llega por query no se
+# reenvía tal cual al portal.
+ACCOUNT_TYPES_VALIDOS = ("Trueno", "Turbo-ACH")
+
+INTERNAL_MOVEMENTS_MAX_AGE = int(
+    os.environ.get("RELAMPAGO_INTERNAL_MOVEMENTS_MAX_AGE", "30")
+)
+# Una entrada por accountType · pedir Trueno no puede servir el cache de ACH.
+MOVEMENTS_CACHE = {}
+_movements_cache_lock = threading.Lock()
+
+
+def _fetch_movements(account_type: str | None) -> dict:
+    """Consulta el portal y deja la última lectura BUENA en MOVEMENTS_CACHE."""
+    if account_type == "Trueno":
+        result = relampago.get_trueno_transactions()
+    elif account_type == "Turbo-ACH":
+        result = relampago.get_ach_transactions()
+    else:
+        result = relampago.get_transactions()
+
+    clave = account_type or "_all"
+    with _movements_cache_lock:
+        entrada = MOVEMENTS_CACHE.setdefault(
+            clave,
+            {"data": None, "fetched_epoch": None, "last_error": None},
+        )
+        if result.get("ok"):
+            entrada["data"] = result.get("data")
+            entrada["fetched_epoch"] = time.time()
+        else:
+            entrada["last_error"] = result.get("error") or result.get("status")
+    return result
+
+
+@app.route("/internal/movements")
+def internal_movements():
+    """Movimientos de Relampago para el backend (red interna, sin auth).
+
+    Mismo contrato que /internal/balance: si la consulta en vivo falla se
+    devuelve la última lectura buena con `stale: true` y el error, en vez de
+    404 o lista vacía. Una lista vacía y "no pude leer" no son lo mismo: la
+    primera se usa para concluir que no hubo movimientos."""
+    account_type = (request.args.get("accountType") or "").strip() or None
+    if account_type is not None and account_type not in ACCOUNT_TYPES_VALIDOS:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "account_type_invalido",
+                    "validos": list(ACCOUNT_TYPES_VALIDOS),
+                }
+            ),
+            400,
+        )
+
+    clave = account_type or "_all"
+    with _movements_cache_lock:
+        entrada = MOVEMENTS_CACHE.get(clave) or {}
+        fetched = entrada.get("fetched_epoch")
+    fresh = fetched is not None and time.time() - fetched <= INTERNAL_MOVEMENTS_MAX_AGE
+
+    live_error = None
+    if not fresh:
+        r = _fetch_movements(account_type)
+        if not r.get("ok"):
+            live_error = r.get("error") or r.get("status")
+
+    with _movements_cache_lock:
+        entrada = MOVEMENTS_CACHE.get(clave) or {}
+        data = entrada.get("data")
+        fetched = entrada.get("fetched_epoch")
+
+    age = None if fetched is None else int(time.time() - fetched)
+    stale = data is None or age > INTERNAL_MOVEMENTS_MAX_AGE
+    # El portal devuelve los movimientos en `data.transfers[]`; la variante sin
+    # accountType puede traer otra forma, así que se publica `data` completo y
+    # `transfers` como atajo cuando existe.
+    transfers = (data or {}).get("transfers") if isinstance(data, dict) else None
+    body = {
+        "ok": data is not None,
+        "account_type": account_type,
+        "transfers": transfers if transfers is not None else [],
+        "data": data,
+        "updated_at": _iso_utc(fetched),
+        "age_seconds": age,
+        "stale": stale,
+        "session_logged_in": relampago.is_logged_in,
+        "error": live_error,
+    }
+    return jsonify(body), (200 if data is not None else 503)
+
+
 @app.route("/api/balance")
 def api_balance():
     result = _fetch_balance()
